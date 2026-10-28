@@ -13,9 +13,9 @@ Object.assign(globalThis, { window: dom.window, document: dom.document, Element:
 let root: Root | undefined, host: HTMLDivElement | undefined;
 function deferred() { let resolve!: () => void; const promise = new Promise<void>((done) => { resolve = done; }); return { promise, resolve }; }
 function fixture(connected = false) {
-	let statuses: NativeSubscriptionStatus[] = ["github-copilot", "xai"].map((id) => ({ ...emptySubscriptionStatus(id as NativeSubscriptionProviderId), available: true, connected, connectionId: connected ? `local-${id}` : null }));
+	let statuses: NativeSubscriptionStatus[] = ["github-copilot", "xai", "anthropic"].map((id) => ({ ...emptySubscriptionStatus(id as NativeSubscriptionProviderId), available: true, connected, connectionId: connected ? `local-${id}` : null }));
 	const listeners = new Set<() => void>(), login = deferred();
-	const calls = { login: [] as unknown[][], cancel: 0, open: [] as unknown[][], consent: [] as unknown[][], disconnect: [] as string[], retry: [] as string[] };
+	const calls = { login: [] as unknown[][], cancel: 0, open: [] as unknown[][], consent: [] as unknown[][], disconnect: [] as string[], retry: [] as string[], respond: [] as unknown[][] };
 	function push(id: NativeSubscriptionProviderId, next: Partial<NativeSubscriptionStatus>) {
 		statuses = statuses.map((s) => s.providerId === id ? { ...s, revision: s.revision + 1, ...next } : s); for (const listener of listeners) listener();
 	}
@@ -23,7 +23,7 @@ function fixture(connected = false) {
 		status: async () => structuredClone(statuses),
 		login: async (id, enabled) => { calls.login.push([id, enabled]); push(id, { pending: true, interaction: { attemptId: "attempt", userCode: "PUBLIC-CODE", browser: { id: "opaque-action", url: "https://auth.example/device" }, progress: "Complete sign-in in your browser." } }); await login.promise; },
 		cancel: async (id) => { calls.cancel++; push(id, { pending: false, interaction: undefined }); },
-		respond: async () => {}, open: async (...args) => { calls.open.push(args); }, retry: async (id) => { calls.retry.push(id); },
+		respond: async (...args) => { calls.respond.push(args); }, open: async (...args) => { calls.open.push(args); }, retry: async (id) => { calls.retry.push(id); },
 		disconnect: async (id) => { calls.disconnect.push(id); push(id, { connected: false, connectionId: null }); },
 		consent: async (id, enabled) => { calls.consent.push([id, enabled]); push(id, { allowBackgroundUse: enabled }); },
 		onChange: (listener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
@@ -33,7 +33,7 @@ function fixture(connected = false) {
 }
 async function mount() {
 	host = document.createElement("div"); document.body.append(host); root = createRoot(host);
-	await act(async () => root!.render(<NativeSubscriptionUIProvider><NativeSubscriptionConnection providerId="github-copilot" /><NativeSubscriptionConnection providerId="xai" /></NativeSubscriptionUIProvider>));
+	await act(async () => root!.render(<NativeSubscriptionUIProvider><NativeSubscriptionConnection providerId="github-copilot" /><NativeSubscriptionConnection providerId="xai" /><NativeSubscriptionConnection providerId="anthropic" /></NativeSubscriptionUIProvider>));
 }
 function maybeButton(text: string, scope: ParentNode = document) { return [...scope.querySelectorAll<HTMLButtonElement>("button")].find((element) => element.textContent === text); }
 function button(text: string, scope: ParentNode = document) { const found = maybeButton(text, scope); assert(found, `missing button ${text}`); return found; }
@@ -45,14 +45,17 @@ async function click(element: HTMLElement) { assert(element); await act(async ()
 async function connectionStep(id: string) { await click(button("Connect", row(id))); await click(button("Continue", dialog())); }
 afterEach(async () => { await act(async () => root?.unmount()); host?.remove(); root = undefined; host = undefined; delete window.lh; });
 
-test("three compact rows render in approved order with no browser-only sign-in or fabricated identities", () => {
-	const html = renderToStaticMarkup(<ChatGPTUIProvider><NativeSubscriptionUIProvider><SubscriptionConnections /></NativeSubscriptionUIProvider></ChatGPTUIProvider>);
-	assert(html.indexOf('data-testid="chatgpt-connection"') < html.indexOf('data-testid="github-copilot-connection"'));
-	assert(html.indexOf('data-testid="github-copilot-connection"') < html.indexOf('data-testid="xai-connection"'));
-	assert.equal((html.match(/>Connect<\/button>/g) ?? []).length, 3);
-	assert(!html.includes("@")); assert(!html.includes("Add accounts"));
+test("four compact rows render in approved order with no browser-only sign-in or fabricated identities", () => {
+	for (const setup of [false, true]) {
+		const html = renderToStaticMarkup(<ChatGPTUIProvider><NativeSubscriptionUIProvider><SubscriptionConnections setup={setup} /></NativeSubscriptionUIProvider></ChatGPTUIProvider>);
+		assert(html.indexOf('data-testid="chatgpt-connection"') < html.indexOf('data-testid="github-copilot-connection"'));
+		assert(html.indexOf('data-testid="github-copilot-connection"') < html.indexOf('data-testid="xai-connection"'));
+		assert(html.indexOf('data-testid="xai-connection"') < html.indexOf('data-testid="anthropic-connection"'));
+		assert.equal((html.match(/>Connect<\/button>/g) ?? []).length, 4);
+		assert(!html.includes("@")); assert(!html.includes("Add accounts"));
+	}
 });
-for (const [id, label] of [["github-copilot", "GitHub Copilot"], ["xai", "Grok"]] as const) test(`${id}: disclosure and connection are separate steps with no duplicated content or early authorization`, async () => {
+for (const [id, label] of [["github-copilot", "GitHub Copilot"], ["xai", "Grok"], ["anthropic", "Anthropic"]] as const) test(`${id}: disclosure and connection are separate steps with no duplicated content or early authorization`, async () => {
 	const f = fixture(); await mount(); await click(button("Connect", row(id)));
 	assert.equal(dialog().querySelector("h2")?.textContent, label);
 	assert(dialog().querySelector('[data-testid="subscription-privacy-notice"]')); assert(!toggle());
@@ -130,4 +133,39 @@ test("required native prompts render and commit cannot be cancelled through butt
 		for (const type of ["pointerdown", "pointerup", "click"]) { const event = new window.Event(type, { bubbles: true }); Object.defineProperties(event, { pointerId: { value: 1 }, isPrimary: { value: true }, button: { value: 0 } }); backdrop.dispatchEvent(event); }
 	});
 	assert(dialog()); assert.equal(f.calls.cancel, 0); await act(async () => f.login.resolve());
+});
+async function change(element: HTMLInputElement | HTMLSelectElement, value: string) {
+	if (element.tagName === "SELECT") {
+		await act(async () => { Object.defineProperty(element, "value", { configurable: true, writable: true, value }); element.dispatchEvent(new window.Event("change", { bubbles: true })); });
+		return;
+	}
+	// react-dom loaded before this DOM existed, so it uses its focus/keyup text-input path (which attaches an IE listener).
+	Object.assign(element, { attachEvent() {}, detachEvent() {} });
+	await act(async () => {
+		element.dispatchEvent(new window.Event("focusin", { bubbles: true }));
+		Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")!.set!.call(element, value);
+		element.dispatchEvent(new window.Event("keyup", { bubbles: true }));
+	});
+}
+/** linkedom has no implicit submission; submit only through an enabled Continue. */
+async function submitPrompt() {
+	assert(!button("Continue", dialog()).disabled);
+	await act(async () => { dialog().querySelector("form")!.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true })); });
+}
+test("Anthropic Connect offers SDK browser and copy-code login choices, then commits the pasted code to a connected row", async () => {
+	const f = fixture(); await mount(); await connectionStep("anthropic"); await click(button("Connect", dialog()));
+	assert.deepEqual(f.calls.login, [["anthropic", undefined]]);
+	await act(async () => f.push("anthropic", { interaction: { attemptId: "claude-attempt", prompt: { id: "method", type: "select", message: "Select Anthropic login method:", options: [{ id: "browser", label: "Browser login (default)" }, { id: "copy_code", label: "Copy code login (headless)" }] } } }));
+	const select = dialog().querySelector<HTMLSelectElement>("select")!;
+	assert.deepEqual([...select.querySelectorAll("option")].filter((option) => option.getAttribute("value")).map((option) => option.textContent), ["Browser login (default)", "Copy code login (headless)"]);
+	assert(button("Continue", dialog()).disabled);
+	await change(select, "copy_code"); await submitPrompt();
+	assert.deepEqual(f.calls.respond, [["anthropic", "claude-attempt", "method", "copy_code"]]);
+	await act(async () => f.push("anthropic", { interaction: { attemptId: "claude-attempt", browser: { id: "claude-authorize", url: "https://claude.ai/oauth/authorize" }, progress: "Complete sign-in in your browser.", prompt: { id: "code", type: "manual_code", message: "Paste the code Anthropic shows after you sign in:", placeholder: "code#state" } } }));
+	await click(button("Open browser", dialog())); assert.deepEqual(f.calls.open, [["anthropic", "claude-attempt", "claude-authorize"]]);
+	const code = dialog().querySelector<HTMLInputElement>("input")!; assert.equal(code.getAttribute("placeholder"), "code#state"); assert.equal(code.getAttribute("type"), "text");
+	await change(code, "fixture-code#fixture-state"); await submitPrompt();
+	assert.deepEqual(f.calls.respond.at(-1), ["anthropic", "claude-attempt", "code", "fixture-code#fixture-state"]);
+	await act(async () => { f.push("anthropic", { pending: false, interaction: undefined, connected: true, connectionId: "local-anthropic" }); f.login.resolve(); });
+	assert(!dialog()); assert(button("Manage…", row("anthropic"))); assert(button("Connect", row("xai")));
 });

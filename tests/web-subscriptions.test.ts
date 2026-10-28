@@ -7,6 +7,7 @@ import { createRequire } from "node:module";
 import { createModels, type OAuthCredential, type ProviderAuthInteraction } from "@earendil-works/pi-ai";
 import { githubCopilotProvider } from "@earendil-works/pi-ai/providers/github-copilot";
 import { xaiProvider } from "@earendil-works/pi-ai/providers/xai";
+import { anthropicProvider } from "@earendil-works/pi-ai/providers/anthropic";
 
 const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lh-web-sub-"));
 process.env.LH_AUTH_FILE = path.join(directory, "auth.json");
@@ -20,7 +21,7 @@ const { subscriptionControlsResponse, subscriptionBrowserResponse } = await impo
 const chat = await import("../src/agent/chatgpt-bridge.ts");
 const native = await import("../src/agent/subscription-bridge.ts");
 const { piModels } = await import("../src/agent/models.ts");
-const { refreshConnectionCatalog } = await import("../src/server/model-catalog.ts");
+const { refreshConnectionCatalog, modelCatalog } = await import("../src/server/model-catalog.ts");
 const model = piModels().getModels("openai").find((entry) => entry.api === "openai-responses")!;
 const originalFetch = globalThis.fetch;
 globalThis.fetch = async (input) => {
@@ -28,9 +29,10 @@ globalThis.fetch = async (input) => {
 	return Response.json({ models: [{ slug: model.id, display_name: "Fixture ChatGPT", visibility: "list" }] });
 };
 const copilot = githubCopilotProvider().getModels()[0]!;
-const credentials = (id: string): OAuthCredential => ({ type: "oauth", access: id === "xai" ? "fixture-xai-access" : "tid=fixture;proxy-ep=proxy.individual.githubcopilot.com;", refresh: "fixture-refresh", expires: Date.now() + 3600000, ...(id === "github-copilot" ? { availableModelIds: [copilot.id] } : {}) });
+const access: Record<string, string> = { "github-copilot": "tid=fixture;proxy-ep=proxy.individual.githubcopilot.com;", xai: "fixture-xai-access", anthropic: "sk-ant-oat01-fixture-claude-access" };
+const credentials = (id: string): OAuthCredential => ({ type: "oauth", access: access[id]!, refresh: "fixture-refresh", expires: Date.now() + 3600000, ...(id === "github-copilot" ? { availableModelIds: [copilot.id] } : {}) });
 await fs.writeFile(path.join(directory, "chatgpt-credentials.json"), JSON.stringify({ version: 1, hostId: "fixture-host", allowBackgroundUse: true, activeId: "fixture-account", registrations: [{ id: "fixture-account", clientId: "oaiapp_fixture", issuer: "https://auth.openai.com", subject: "fixture-subject", email: "fixture@example.invalid", tokens: { accessToken: "fixture-chatgpt-access", refreshToken: "fixture-chatgpt-refresh", idToken: "fixture-id-token", scopes: SCOPES, expiresAt: Date.now() + 3600000 } }] }), { mode: 0o600 });
-for (const id of ["github-copilot", "xai"]) await fs.writeFile(path.join(directory, `${id}-credentials.json`), JSON.stringify({ version: 1, allowBackgroundUse: true, connectionId: "00000000-0000-4000-8000-000000000001", credential: credentials(id) }), { mode: 0o600 });
+for (const id of ["github-copilot", "xai", "anthropic"]) await fs.writeFile(path.join(directory, `${id}-credentials.json`), JSON.stringify({ version: 1, allowBackgroundUse: true, connectionId: "00000000-0000-4000-8000-000000000001", credential: credentials(id) }), { mode: 0o600 });
 function request(command?: Record<string, unknown>, origin = "http://192.168.1.10:3000") {
 	return new Request(`${origin}/api/subscriptions`, { method: command ? "POST" : "GET", headers: { host: new URL(origin).host, origin, "sec-fetch-site": "same-origin", "x-learnharness-subscriptions": "1", "content-type": "application/json" }, ...(command ? { body: JSON.stringify(command) } : {}) });
 }
@@ -38,15 +40,31 @@ after(async () => { webSubscriptionOwner().close(); globalThis.fetch = originalF
 
 test("ordinary web restores configured sibling credentials, private runtime leases work for LAN-owned requests", async () => {
 	await refreshConnectionCatalog();
-	assert(chat.chatGPTConnected()); assert(native.nativeSubscriptionConnected("github-copilot")); assert(native.nativeSubscriptionConnected("xai"));
+	assert(chat.chatGPTConnected()); assert(native.nativeSubscriptionConnected("github-copilot")); assert(native.nativeSubscriptionConnected("xai")); assert(native.nativeSubscriptionConnected("anthropic"));
 	assert.equal((await chat.chatGPTLease(chat.chatGPTScope(model.id), false)).accessToken, "fixture-chatgpt-access");
 	const xaiModel = native.nativeSubscriptionModels().find((entry) => entry.provider === "xai-subscription")!;
 	assert.equal((await native.subscriptionLease(native.subscriptionScope("xai", xaiModel.id), false)).apiKey, "fixture-xai-access");
+	const claudeModel = native.nativeSubscriptionModels().find((entry) => entry.provider === "anthropic-subscription")!;
+	assert.equal((await native.subscriptionLease(native.subscriptionScope("anthropic", claudeModel.id), false)).apiKey, "sk-ant-oat01-fixture-claude-access");
 	const response = await subscriptionControlsResponse(request());
 	assert.equal(response.status, 200); assert.equal(response.headers.get("cache-control"), "no-store");
 	const publicState = await response.text();
-	for (const secret of ["fixture-chatgpt-access", "fixture-chatgpt-refresh", "fixture-id-token", "fixture-xai-access", "fixture-refresh"]) assert(!publicState.includes(secret));
+	for (const secret of ["fixture-chatgpt-access", "fixture-chatgpt-refresh", "fixture-id-token", "fixture-xai-access", "sk-ant-oat01-fixture-claude-access", "fixture-refresh"]) assert(!publicState.includes(secret));
 	assert(publicState.includes("fixture@example.invalid"));
+});
+
+test("disconnecting the Claude subscription removes only its route; API-key Anthropic stays selectable", async () => {
+	const previous = process.env.ANTHROPIC_API_KEY; process.env.ANTHROPIC_API_KEY = "sk-ant-api03-fixture-api-key";
+	try {
+		const routes = () => { const body = modelCatalog(); return Object.fromEntries(["anthropic", "anthropic-subscription", "xai-subscription"].map((id) => [id, { connected: body.providers.find((p) => p.id === id)?.keyPresent, models: body.models.filter((m) => m.provider === id).length }])); };
+		const before = routes();
+		for (const id of ["anthropic", "anthropic-subscription"]) { assert.equal(before[id]!.connected, true, id); assert(before[id]!.models > 0, id); }
+		assert.equal((await subscriptionControlsResponse(request({ providerId: "anthropic", op: "disconnect" }))).status, 200);
+		const after = routes();
+		assert.deepEqual(after["anthropic-subscription"], { connected: false, models: 0 });
+		assert.deepEqual(after.anthropic, before.anthropic); assert.deepEqual(after["xai-subscription"], before["xai-subscription"]);
+		assert.deepEqual(JSON.parse(await fs.readFile(path.join(directory, "anthropic-credentials.json"), "utf8")), { version: 1, allowBackgroundUse: true });
+	} finally { if (previous === undefined) delete process.env.ANTHROPIC_API_KEY; else process.env.ANTHROPIC_API_KEY = previous; }
 });
 
 test("web background OFF immediately aborts background streams, retains foreground and rejects private background leases", async () => {
@@ -90,10 +108,10 @@ test("HTTP controls reject cross-origin, simple-form and private credential oper
 
 function fakeSDK(login: (id: string, interaction: ProviderAuthInteraction) => Promise<OAuthCredential>) {
 	const factory = (id: string) => {
-		const provider = id === "xai" ? xaiProvider() : githubCopilotProvider();
+		const provider = id === "xai" ? xaiProvider() : id === "anthropic" ? anthropicProvider() : githubCopilotProvider();
 		return { ...provider, auth: { oauth: { ...provider.auth.oauth!, login: (interaction: ProviderAuthInteraction) => login(id, interaction), refresh: async () => credentials(id) } } };
 	};
-	return { createModels, githubCopilotProvider: () => factory("github-copilot"), xaiProvider: () => factory("xai") };
+	return { createModels, githubCopilotProvider: () => factory("github-copilot"), xaiProvider: () => factory("xai"), anthropicProvider: () => factory("anthropic") };
 }
 test("device browser actions preserve complete URLs privately, are origin-bound, one-use and cancellation-bound", async () => {
 	const scratch = await fs.mkdtemp(path.join(os.tmpdir(), "lh-web-action-"));

@@ -18,7 +18,8 @@ test("only explicit subscription route IDs count as subscription use; names stay
 	assert.equal(subscriptionLabel("chatgpt:gpt-5"), "ChatGPT");
 	assert.equal(subscriptionLabel("github-copilot-subscription:fixture"), "GitHub Copilot");
 	assert.equal(subscriptionLabel("xai-subscription:grok"), "Grok");
-	for (const model of ["openai:gpt-5", "xai:grok", "github-copilot:fixture", "meta:muse", "radius:any", "kimi-coding:any"]) assert(!isSubscriptionModel(model));
+	assert.equal(subscriptionLabel("anthropic-subscription:claude-sonnet-5"), "Anthropic");
+	for (const model of ["openai:gpt-5", "xai:grok", "github-copilot:fixture", "anthropic:claude-sonnet-5", "meta:muse", "radius:any", "kimi-coding:any"]) assert(!isSubscriptionModel(model));
 	assert.deepEqual(subscriptionLabels(["chatgpt:a", "xai-subscription:b", "chatgpt:c", "github-copilot-subscription:d"]), ["ChatGPT", "Grok", "GitHub Copilot"]);
 	assert.equal(planCostLabel(0.12, ["Grok"], (n) => `$${n.toFixed(2)}`), "$0.12 + Grok");
 	assert.equal(planCostLabel(0.67, ["ChatGPT"], (n) => `$${n.toFixed(2)}`), "$0.67 + ChatGPT");
@@ -40,4 +41,11 @@ test("model menu distinguishes subscription connection and shows provider label 
 	const native = piModels().getModels("xai")[0]!;
 	const html = renderToStaticMarkup(<ModelMenuList models={[toModelDto({ ...native, provider: "xai-subscription" })]} effectiveId={undefined} onPick={() => {}} />);
 	assert(html.includes("Grok (subscription)")); assert(html.includes(">Grok</span>")); assert(!html.includes("USD per 1M")); assert(!html.includes("$0"));
+});
+test("Claude through the subscription and through an Anthropic API key are distinct picker rows with distinct labels", () => {
+	const native = piModels().getModels("anthropic")[0]!;
+	const html = renderToStaticMarkup(<ModelMenuList models={[toModelDto(native), toModelDto({ ...native, provider: "anthropic-subscription" })]} effectiveId={native.id} effectiveProvider="anthropic-subscription" onPick={() => {}} />);
+	assert.equal((html.match(/Anthropic \(subscription\)/g) ?? []).length, 1);
+	assert(html.includes(`anthropic · ${native.id}`)); assert(html.includes("USD per 1M"));
+	assert.equal((html.match(/data-testid="model-option-/g) ?? []).length, 2);
 });
