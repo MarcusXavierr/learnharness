@@ -289,6 +289,23 @@ test("shared refresh fences late failure as well as late success, and Retry clea
 	await answer(4, fresh);
 });
 
+test("Models setup offers the Claude subscription as its own selectable row beside API-key Anthropic and saves its route", async () => {
+	installFetch();
+	const claudeKey: ModelCatalogEntry = { ...b, provider: "anthropic", cost: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 } };
+	const claudeSubscription: ModelCatalogEntry = { ...b, provider: "anthropic-subscription" };
+	const body = catalog(); body.models = [a, claudeKey, claudeSubscription];
+	body.providers = [{ ...provider, keyPresent: true }, { id: "anthropic", envVar: "ANTHROPIC_API_KEY", keyPresent: true }, { id: "anthropic-subscription", envVar: "", keyPresent: true }];
+	await warm(body); await render(<><Reader />{setup()}</>); await answer(1, body);
+	await click("setup-trigger-strong");
+	const rows = [...document.querySelectorAll<HTMLElement>(`[data-testid="model-option-${b.id}"]`)];
+	assert.equal(rows.length, 2);
+	const subscriptionRow = rows.find((row) => row.textContent?.includes("Anthropic (subscription)"));
+	assert.ok(subscriptionRow); assert.ok(rows.some((row) => row.textContent?.includes(`anthropic · ${b.id}`)));
+	await act(async () => subscriptionRow.click());
+	await click("setup-save");
+	assert.deepEqual(writes[0]!.strong!.model, { provider: "anthropic-subscription", id: b.id });
+});
+
 test("OpenCode's saved shared credential names both Pi providers without changing addable-provider semantics", () => {
 	const providers = [{ id: "opencode", envVar: "OPENCODE_API_KEY", label: "OpenCode Zen" }, { id: "opencode-go", envVar: "OPENCODE_API_KEY", label: "OpenCode Go" }];
 	assert.equal(providerKeyLabel("OPENCODE_API_KEY", providers), "OpenCode (Zen / Go)");

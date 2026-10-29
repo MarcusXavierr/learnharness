@@ -4,25 +4,29 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
-import { createModels, type OAuthCredential, type ProviderAuthInteraction } from "@earendil-works/pi-ai";
+import { createModels, type OAuthCredential, type Provider, type ProviderAuthInteraction } from "@earendil-works/pi-ai";
 import { githubCopilotProvider } from "@earendil-works/pi-ai/providers/github-copilot";
 import { xaiProvider } from "@earendil-works/pi-ai/providers/xai";
+import { anthropicProvider } from "@earendil-works/pi-ai/providers/anthropic";
 import type { NativeSubscriptionScope } from "../src/core/contracts/subscriptions.ts";
 const require = createRequire(import.meta.url);
 const { createSubscriptions, loadSubscriptionSDK, validEndpoint, publicError } = require("../electron/subscriptions.cjs");
 const { fileStore, validateState } = require("../electron/subscription-store.cjs");
 const { subscriptionControl } = require("../electron/subscription-ipc.cjs");
-const ids = ["github-copilot", "xai"] as const;
-const credential = (id: string, expires = Date.now() + 3600000): OAuthCredential => ({ type: "oauth", access: id === "xai" ? "fixture-xai-access" : "tid=fixture;proxy-ep=proxy.individual.githubcopilot.com;", refresh: "fixture-refresh", expires, ...(id === "github-copilot" ? { availableModelIds: [githubCopilotProvider().getModels()[0]!.id] } : {}) });
+const ids = ["github-copilot", "xai", "anthropic"] as const;
+const access = { "github-copilot": "tid=fixture;proxy-ep=proxy.individual.githubcopilot.com;", xai: "fixture-xai-access", anthropic: "sk-ant-oat01-fixture-anthropic-access" } as Record<string, string>;
+const credential = (id: string, expires = Date.now() + 3600000): OAuthCredential => ({ type: "oauth", access: access[id]!, refresh: "fixture-refresh", expires, ...(id === "github-copilot" ? { availableModelIds: [githubCopilotProvider().getModels()[0]!.id] } : {}) });
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>((done) => { resolve = done; }); return { resolve, promise }; }
-async function fixture(options: { login?: (id: string, interaction: ProviderAuthInteraction) => Promise<OAuthCredential>; refresh?: (id: string, value: OAuthCredential, signal: AbortSignal) => Promise<OAuthCredential>; stores?: Record<string, unknown> } = {}) {
+async function fixture(options: { native?: boolean; login?: (id: string, interaction: ProviderAuthInteraction) => Promise<OAuthCredential>; refresh?: (id: string, value: OAuthCredential, signal: AbortSignal) => Promise<OAuthCredential>; stores?: Record<string, unknown> } = {}) {
 	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lh-subscription-auth-"));
 	let refreshes = 0;
+	const factories: Record<string, () => Provider> = { "github-copilot": githubCopilotProvider, xai: xaiProvider, anthropic: anthropicProvider };
 	const factory = (id: string) => {
-		const native = id === "xai" ? xaiProvider() : githubCopilotProvider();
+		const native = factories[id]!();
+		if (options.native) return native;
 		return { ...native, auth: { ...native.auth, oauth: { ...native.auth.oauth!, login: (interaction: ProviderAuthInteraction) => options.login?.(id, interaction) ?? Promise.resolve(credential(id)), refresh: async (value: OAuthCredential, signal: AbortSignal) => { refreshes++; return options.refresh?.(id, value, signal) ?? { ...credential(id), refresh: "fixture-rotated" }; } } } };
 	};
-	const sdk = { createModels, githubCopilotProvider: () => factory("github-copilot"), xaiProvider: () => factory("xai") };
+	const sdk = { createModels, githubCopilotProvider: () => factory("github-copilot"), xaiProvider: () => factory("xai"), anthropicProvider: () => factory("anthropic") };
 	const updates: any[] = [], opened: string[] = [];
 	const controller = createSubscriptions({ directory, sdk, stores: options.stores, openExternal: async (url: string) => { opened.push(url); }, onChange: (snapshot: unknown) => updates.push(snapshot) });
 	await controller.ready;
@@ -35,7 +39,7 @@ async function fixture(options: { login?: (id: string, interaction: ProviderAuth
 test("main loader resolves Pi's import-only PUBLIC package exports and native OAuth without a CLI or network", async () => {
 	const sdk = await loadSubscriptionSDK(path.resolve(import.meta.dirname, ".."));
 	assert.equal(typeof sdk.createModels, "function");
-	for (const [id, factory] of [["github-copilot", sdk.githubCopilotProvider], ["xai", sdk.xaiProvider]] as const) {
+	for (const [id, factory] of [["github-copilot", sdk.githubCopilotProvider], ["xai", sdk.xaiProvider], ["anthropic", sdk.anthropicProvider]] as const) {
 		const provider = factory(), store = new sdk.InMemoryCredentialStore(); await store.modify(id, () => credential(id));
 		const models = sdk.createModels({ credentials: store }); models.setProvider({ ...provider, auth: { oauth: provider.auth.oauth } });
 		const resolved = await models.getAuth(provider.getModels()[0]); assert.equal(resolved.auth.apiKey, credential(id).access);
@@ -208,6 +212,85 @@ test("enterprise domains are preserved; derived endpoints and control errors are
 	await assert.rejects(subscriptionControl({ op: "status" }, { status: async () => { throw new Error("private-token-response"); } }), (error: Error) => !error.message.includes("private-token-response"));
 	assert(!publicError(new Error("private-token-response")).includes("private-token-response"));
 });
+test("Anthropic subscription endpoint is only the public HTTPS API origin", () => {
+	const value = credential("anthropic");
+	for (const baseUrl of [undefined, "https://api.anthropic.com", "https://api.anthropic.com/", "https://api.anthropic.com:443/"]) assert(validEndpoint("anthropic", { apiKey: value.access, ...(baseUrl ? { baseUrl } : {}) }, value), String(baseUrl));
+	for (const baseUrl of ["http://api.anthropic.com", "https://api.anthropic.com:8443", "https://user:pass@api.anthropic.com", "https://api.anthropic.com/v1", "https://api.anthropic.com/?x=1", "https://api.anthropic.com/#x", "https://attacker.example", "https://api.anthropic.com.attacker.example"]) assert(!validEndpoint("anthropic", { apiKey: value.access, baseUrl }, value), baseUrl);
+	assert(!validEndpoint("anthropic", {}, value));
+});
+
+const CLAUDE_TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
+/** Fakes only Anthropic's token endpoint; any other network request fails the test. */
+function claudeTokenEndpoint(responses: ((body: Record<string, string>) => Response)[]) {
+	const calls: Record<string, string>[] = [], original = globalThis.fetch;
+	globalThis.fetch = async (input, init) => {
+		assert.equal(String(input), CLAUDE_TOKEN_URL, "unexpected network request");
+		const body = JSON.parse(String(init?.body)); calls.push(body);
+		const next = responses.shift(); assert(next, "unexpected token request"); return next(body);
+	};
+	return { calls, restore() { globalThis.fetch = original; } };
+}
+const claudeTokens = (accessToken: string, refreshToken: string, expiresIn = 3600) => () => Response.json({ access_token: accessToken, refresh_token: refreshToken, expires_in: expiresIn });
+async function until<T>(read: () => Promise<T | undefined>): Promise<T> {
+	for (let turn = 0; turn < 1000; turn++) { const value = await read(); if (value !== undefined) return value; await new Promise((resolve) => setImmediate(resolve)); }
+	throw new Error("condition not reached");
+}
+async function claudeCopyCodeLogin(f: Awaited<ReturnType<typeof fixture>>) {
+	const interaction = async () => (await f.controller.status()).find((s: any) => s.providerId === "anthropic").interaction;
+	const pending = f.controller.login("anthropic", true);
+	const choice = await until(async () => { const value = await interaction(); return value?.prompt?.type === "select" ? value : undefined; });
+	assert.deepEqual(choice.prompt.options.map((option: { label: string }) => option.label), ["Browser login (default)", "Copy code login (headless)"]);
+	await f.controller.respond("anthropic", choice.attemptId, choice.prompt.id, "copy_code");
+	const code = await until(async () => { const value = await interaction(); return value?.prompt?.type === "manual_code" ? value : undefined; });
+	assert.equal(code.browser.url, "https://claude.ai/oauth/authorize");
+	await f.controller.open("anthropic", code.attemptId, code.browser.id);
+	assert.equal(new URL(f.opened.at(-1)!).searchParams.get("redirect_uri"), "https://platform.claude.com/oauth/code/callback");
+	await f.controller.respond("anthropic", code.attemptId, code.prompt.id, "fixture-authorization-code");
+	await pending;
+}
+async function withAmbientAnthropicKey(run: () => Promise<void>) {
+	const previous = process.env.ANTHROPIC_API_KEY; process.env.ANTHROPIC_API_KEY = "sk-ant-api03-ambient-must-never-be-used";
+	try { await run(); } finally { if (previous === undefined) delete process.env.ANTHROPIC_API_KEY; else process.env.ANTHROPIC_API_KEY = previous; }
+}
+test("Anthropic native OAuth offers browser and copy-code login, connects without an API key and survives restart", () => withAmbientAnthropicKey(async () => {
+	const endpoint = claudeTokenEndpoint([claudeTokens("sk-ant-oat01-fixture-signed-in", "fixture-claude-refresh")]);
+	const f = await fixture({ native: true });
+	try {
+		await claudeCopyCodeLogin(f);
+		assert.equal(endpoint.calls.length, 1); assert.equal(endpoint.calls[0]!.grant_type, "authorization_code"); assert.equal(endpoint.calls[0]!.code, "fixture-authorization-code");
+		const status = (await f.controller.status()).find((s: any) => s.providerId === "anthropic"); assert(status.connected); assert(!status.interaction);
+		assert(!JSON.stringify(await f.controller.snapshot()).includes("sk-ant-oat01-fixture-signed-in")); assert(!JSON.stringify(await f.controller.snapshot()).includes("fixture-claude-refresh"));
+		assert.equal((await f.controller.lease(await f.scope("anthropic"), false)).auth.apiKey, "sk-ant-oat01-fixture-signed-in");
+		const reloaded = createSubscriptions({ directory: f.directory, sdk: f.sdk, openExternal: async () => {} }); await reloaded.ready;
+		try {
+			const restored = (await reloaded.snapshot()), restoredStatus = restored.statuses.find((s: any) => s.providerId === "anthropic");
+			assert(restoredStatus.connected); assert.equal(restoredStatus.connectionId, status.connectionId);
+			const scope = { providerId: "anthropic" as const, connectionId: restoredStatus.connectionId, epoch: restoredStatus.epoch, authorityRevision: restoredStatus.authorityRevision, selectedModelId: restored.models.anthropic[0].id };
+			assert.equal((await reloaded.lease(scope, false)).auth.apiKey, "sk-ant-oat01-fixture-signed-in");
+		} finally { reloaded.close(); }
+		assert.equal(endpoint.calls.length, 1);
+	} finally { endpoint.restore(); await f.cleanup(); }
+}));
+test("Anthropic expired credential refreshes natively; failed refresh never leases or uses ANTHROPIC_API_KEY, and Retry rotates", () => withAmbientAnthropicKey(async () => {
+	const endpoint = claudeTokenEndpoint([
+		claudeTokens("sk-ant-oat01-fixture-expired", "fixture-claude-refresh", 0),
+		() => Response.json({ error: "invalid_grant" }, { status: 400 }),
+		claudeTokens("sk-ant-oat01-fixture-rotated", "fixture-claude-rotated-refresh"),
+	]);
+	const f = await fixture({ native: true });
+	try {
+		await claudeCopyCodeLogin(f); const scope = await f.scope("anthropic");
+		await assert.rejects(f.controller.lease(scope, false), (error: any) => error.code === "refresh");
+		assert.equal(endpoint.calls[1]!.grant_type, "refresh_token"); assert.equal(endpoint.calls[1]!.refresh_token, "fixture-claude-refresh");
+		const failed = (await f.controller.status()).find((s: any) => s.providerId === "anthropic"); assert(!failed.connected); assert(failed.error); assert(failed.connectionId);
+		assert.equal(JSON.parse(await fs.readFile(path.join(f.directory, "anthropic-credentials.json"), "utf8")).credential.access, "sk-ant-oat01-fixture-expired");
+		await f.controller.retry("anthropic");
+		const saved = JSON.parse(await fs.readFile(path.join(f.directory, "anthropic-credentials.json"), "utf8"));
+		assert.equal(saved.credential.access, "sk-ant-oat01-fixture-rotated"); assert.equal(saved.credential.refresh, "fixture-claude-rotated-refresh");
+		assert.equal((await f.controller.lease(await f.scope("anthropic"), false)).auth.apiKey, "sk-ant-oat01-fixture-rotated");
+		assert.equal(endpoint.calls.length, 3);
+	} finally { endpoint.restore(); await f.cleanup(); }
+}));
 test("atomic store failed rename preserves original and leaves no temporary files", async () => {
 	const f = await fixture();
 	try {

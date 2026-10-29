@@ -5,7 +5,9 @@ const { createRequire, registerHooks } = require("node:module");
 const { pathToFileURL } = require("node:url");
 const { PROVIDERS, fileStore, validateCredential, safeHttps, failure } = require("./subscription-store.cjs");
 
-const LABELS = { "github-copilot": "GitHub Copilot", xai: "Grok" };
+// One explicit SDK factory and default endpoint per native subscription route.
+const FACTORIES = { "github-copilot": "githubCopilotProvider", xai: "xaiProvider", anthropic: "anthropicProvider" };
+const DEFAULT_ENDPOINTS = { "github-copilot": "https://api.individual.githubcopilot.com", xai: "https://api.x.ai/v1", anthropic: "https://api.anthropic.com" };
 const APIS = new Set(["openai-responses", "openai-completions", "anthropic-messages"]);
 const clone = (value) => value === undefined ? undefined : JSON.parse(JSON.stringify(value));
 const MESSAGES = {
@@ -33,15 +35,16 @@ async function loadSubscriptionSDK(baseDirectory) {
 		try { file = resolve.resolve(id); } finally { hook.deregister(); }
 		return import(pathToFileURL(file).href);
 	};
-	const [sdk, copilot, xai] = await Promise.all([load("@earendil-works/pi-ai"), load("@earendil-works/pi-ai/providers/github-copilot"), load("@earendil-works/pi-ai/providers/xai")]);
-	return { ...sdk, ...copilot, ...xai };
+	const [sdk, copilot, xai, anthropic] = await Promise.all([load("@earendil-works/pi-ai"), load("@earendil-works/pi-ai/providers/github-copilot"), load("@earendil-works/pi-ai/providers/xai"), load("@earendil-works/pi-ai/providers/anthropic")]);
+	return { ...sdk, ...copilot, ...xai, ...anthropic };
 }
 function validEndpoint(providerId, auth, credential) {
 	if (!auth || (!(typeof auth.apiKey === "string" && auth.apiKey.length > 0) && !Object.entries(auth.headers ?? {}).some(([key, value]) => ["authorization", "x-api-key", "api-key"].includes(key.toLowerCase()) && typeof value === "string" && value.trim().length > 0))) return false;
-	const value = auth.baseUrl ?? (providerId === "xai" ? "https://api.x.ai/v1" : "https://api.individual.githubcopilot.com");
-	if (!safeHttps(value)) return false;
+	const value = auth.baseUrl ?? DEFAULT_ENDPOINTS[providerId];
+	if (!value || !safeHttps(value)) return false;
 	const url = new URL(value);
 	if (providerId === "xai") return url.origin === "https://api.x.ai" && url.pathname.replace(/\/$/, "") === "/v1" && !url.search && !url.hash;
+	if (providerId === "anthropic") return url.origin === "https://api.anthropic.com" && url.pathname === "/" && !url.search && !url.hash;
 	const domain = credential?.enterpriseUrl;
 	return !url.search && !url.hash && url.pathname === "/" && (!url.port || url.port === "443") && (url.hostname.endsWith(".githubcopilot.com") || (domain && (url.hostname === domain || url.hostname.endsWith(`.${domain}`))));
 }
@@ -82,7 +85,7 @@ function createSubscriptions(options) {
 		if (entry.state.credential) {
 			const auth = await entry.provider.auth.oauth.toAuth(entry.state.credential);
 			if (!validEndpoint(entry.providerId, auth, entry.state.credential)) throw failure("storage");
-			endpoint = auth.baseUrl ?? (entry.providerId === "xai" ? "https://api.x.ai/v1" : "https://api.individual.githubcopilot.com");
+			endpoint = auth.baseUrl ?? DEFAULT_ENDPOINTS[entry.providerId];
 		}
 		if (entry.endpoint !== endpoint) { entry.endpoint = endpoint; entry.authorityRevision++; }
 	}
@@ -99,7 +102,7 @@ function createSubscriptions(options) {
 		await Promise.all([...entries.values()].map(async (entry) => {
 			try {
 				entry.state = clone(await entry.disk.read());
-				const native = entry.providerId === "github-copilot" ? sdk.githubCopilotProvider() : sdk.xaiProvider();
+				const native = sdk[FACTORIES[entry.providerId]]();
 				// No API-key auth method exists in this collection: ambient keys cannot become a fallback.
 				entry.provider = { ...native, auth: { oauth: native.auth.oauth } };
 				const store = {
@@ -248,4 +251,4 @@ function createSubscriptions(options) {
 		close() { closed = true; for (const entry of entries.values()) { cancel(entry.providerId); entry.epoch++; changed(entry); } },
 	};
 }
-module.exports = { createSubscriptions, loadSubscriptionSDK, publicError, validEndpoint, LABELS };
+module.exports = { createSubscriptions, loadSubscriptionSDK, publicError, validEndpoint };

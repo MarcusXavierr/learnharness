@@ -1,9 +1,11 @@
+import { randomUUID } from "node:crypto";
 import { normalizeContext, type Api, type AssistantMessage, type Model, type Provider, type SimpleStreamOptions, type StreamFunction, type TranscriptContext } from "@earendil-works/pi-ai";
 import { AssistantMessageEventStream } from "@earendil-works/pi-ai/utils/event-stream";
 import { transformMessages } from "@earendil-works/pi-ai/api/transform-messages";
 import { NATIVE_SUBSCRIPTIONS, type NativeSubscriptionScope } from "../core/contracts/subscriptions.ts";
 import { nativeSubscriptionId, nativeSubscriptionBackgroundAllowed, subscriptionScope, subscriptionScopeCurrent, subscriptionAdmissionScope, subscriptionLease, subscriptionAbortController, subscriptionDenial } from "./subscription-bridge.ts";
 import { markUnadmittedUsage, type SubscriptionDispatchLifecycle } from "./subscription-request-cycle.ts";
+import { claudeSubscriptionHeaders, claudeSubscriptionPayload, patchClaudeSubscriptionBody } from "./claude-subscription-wire.ts";
 
 export function nativeSubscriptionError(provider: string, message: string): string {
 	const label = NATIVE_SUBSCRIPTIONS.find((p) => p.logicalId === provider)?.label ?? "Subscription";
@@ -34,6 +36,8 @@ export function nativeSubscriptionStream(provider: Provider, background: () => b
 		const purpose = background();
 		const { controller, release } = subscriptionAbortController(nativeId, purpose);
 		const signal = options?.signal ? AbortSignal.any([controller.signal, options.signal]) : controller.signal;
+		// Claude subscription requests carry Cowork wire identity: one session per stream unless the caller names it.
+		const claude = nativeId === "anthropic", sessionId = options?.sessionId ?? randomUUID();
 		void (async () => {
 			let partial = empty(logicalModel), scope: NativeSubscriptionScope | undefined;
 			let committed = false, terminal = false;
@@ -45,23 +49,34 @@ export function nativeSubscriptionStream(provider: Provider, background: () => b
 				if (Object.keys(options?.headers ?? {}).some((key) => ["authorization", "x-api-key", "api-key", "host"].includes(key.toLowerCase()))) throw new Error("Authorization override forbidden");
 				scope = subscriptionScope(nativeId, logicalModel.id); lifecycle?.captured(subscriptionAdmissionScope(scope));
 				const auth = await subscriptionLease(scope, purpose); check();
+				if (claude && !auth.apiKey?.startsWith("sk-ant-oat")) throw new Error("Claude subscription authorization unavailable");
 				const authKeys = new Set(Object.keys(auth.headers ?? {}).map((key) => key.toLowerCase()));
 				if (Object.keys(options?.headers ?? {}).some((key) => authKeys.has(key.toLowerCase()))) throw new Error("Authorization override forbidden");
 				const nativeModel = provider.getModels().find((model) => model.id === logicalModel.id && model.api === logicalModel.api);
 				if (!nativeModel) throw new Error("Native model unavailable");
 				const transport = { ...nativeModel, ...(auth.baseUrl ? { baseUrl: auth.baseUrl } : {}) };
 				const fetch = options?.fetch ?? globalThis.fetch;
-				const source = provider.streamSimple(transport, subscriptionHistory(normalizeContext(context), logicalModel, nativeId), {
-					...options, apiKey: auth.apiKey, headers: { ...options?.headers, ...auth.headers }, signal, maxRetries: 0,
-					fetch: (input, init) => {
+				const history = subscriptionHistory(normalizeContext(context), logicalModel, nativeId), connectionId = scope.connectionId;
+				const source = provider.streamSimple(transport, history, {
+					...options, apiKey: auth.apiKey, headers: { ...options?.headers, ...auth.headers, ...(claude ? claudeSubscriptionHeaders(sessionId) : {}) }, signal, maxRetries: 0,
+					fetch: async (input, init) => {
 						check(); if (committed) throw new Error("Subscription requests do not retry after dispatch");
+						if (claude) {
+							// Fail closed: an unattested Claude body is never sent.
+							if (typeof init?.body !== "string") throw new Error("Claude subscription request body unavailable");
+							init = { ...init, body: await patchClaudeSubscriptionBody(init.body) };
+							check(); if (committed) throw new Error("Subscription requests do not retry after dispatch");
+						}
 						lifecycle?.beforeDispatch(subscriptionAdmissionScope(scope!)); committed = true; return fetch(input, init);
 					},
 					onPayload: async (raw, model) => {
 						const replacement = await options?.onPayload?.(raw, model); check();
-						if (replacement === undefined) return raw;
-						if (!replacement || typeof replacement !== "object" || Array.isArray(replacement)) throw new Error("Invalid model payload override");
-						return { ...replacement, model: (raw as { model: string }).model };
+						let payload = raw;
+						if (replacement !== undefined) {
+							if (!replacement || typeof replacement !== "object" || Array.isArray(replacement)) throw new Error("Invalid model payload override");
+							payload = { ...replacement, model: (raw as { model: string }).model };
+						}
+						return claude ? claudeSubscriptionPayload(payload, history, connectionId, sessionId) : payload;
 					},
 				});
 				for await (const event of source) {

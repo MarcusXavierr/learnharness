@@ -28,12 +28,13 @@ function publish(channel: Channel, packet: Packet) {
 	emit("subscriptions-changed", {});
 }
 async function loadSDK() {
-	const [sdk, copilot, xai] = await Promise.all([
+	const [sdk, copilot, xai, anthropic] = await Promise.all([
 		import("@earendil-works/pi-ai"),
 		import("@earendil-works/pi-ai/providers/github-copilot"),
 		import("@earendil-works/pi-ai/providers/xai"),
+		import("@earendil-works/pi-ai/providers/anthropic"),
 	]);
-	return { ...sdk, ...copilot, ...xai };
+	return { ...sdk, ...copilot, ...xai, ...anthropic };
 }
 
 /** Injectable factories/stores keep all test authentication offline. */
