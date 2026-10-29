@@ -53,7 +53,7 @@ export interface ChatRecord {
 	/** Per-chat model/thinking overrides for the conversation agents. */
 	settings?: ChatSettings;
 	/** Session context attachments (2026-10-29): files the learner attached
-	 *  from the composer, copied under data/attachments/<chatId>/. The agent
+	 *  from the composer, stored once by content under data/attachments/. The agent
 	 *  sees them through the system prompt's attachments section and reads
 	 *  them on demand — contents never ride the record. Append-only. */
 	attachments?: AttachmentRecord[];
@@ -67,8 +67,9 @@ export interface ChatRecord {
 
 export type AttachmentKind = "image" | "pdf" | "epub";
 
-/** One attached file. `file` is the stored name inside the chat's
- *  attachments dir (relative, so LH_DATA_DIR can move); `name` is what the
+/** One attached file. `file` is the content-addressed blob name
+ *  (`<sha256><ext>` under data/attachments/ — relative, so LH_DATA_DIR can
+ *  move; chats attaching the same bytes share it); `name` is what the
  *  learner picked. Structure facts are captured once, at upload. */
 export interface AttachmentRecord {
 	id: string;

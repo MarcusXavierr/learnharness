@@ -1,7 +1,8 @@
 /** Session context attachments (2026-10-29) — the live-UI happy path, end
  * to end through the real app: pick files in the new-session composer, see
  * the chips, send, land on the chat page with the files stored in the
- * session and their ids on the opening message. No model/provider calls:
+ * session and their ids on the opening message; then a second session
+ * attaching the same book shares its stored copy. No model/provider calls:
  * /api/chat is intercepted, the catalog is a fixture, app HOME/data/auth
  * are throwaway. Uploads hit the REAL route (proxy.ts included).
  * Run: LH_TEST_CHROME=/usr/bin/google-chrome node scripts/smoke-attachments.mjs
@@ -101,28 +102,32 @@ try {
 		} catch (err) { if (!/Target closed|Session closed|Invalid InterceptionId/.test(String(err))) errors.push(String(err)); }
 	});
 
-	await page.goto(origin + "/chat/new", { waitUntil: "domcontentloaded", timeout: 120000 });
-	await page.waitForSelector('[data-testid="attach-context"]');
-	const input = await page.$('[data-testid="attachment-input"]');
-	await input.uploadFile(epubPath, pngPath);
-	await page.waitForFunction(() => document.querySelectorAll('[data-testid="attachment-chip"]').length === 2);
-	const chipText = await page.$$eval('[data-testid="attachment-chip"]', els => els.map(e => e.textContent));
-	assert.deepEqual(chipText, ["book.epub", "figure.png"]);
+	/** Start a new session from /chat/new with these files picked. */
+	const startSession = async (paths, names, text) => {
+		await page.goto(origin + "/chat/new", { waitUntil: "domcontentloaded", timeout: 120000 });
+		await page.waitForSelector('[data-testid="attach-context"]');
+		const input = await page.$('[data-testid="attachment-input"]');
+		await input.uploadFile(...paths);
+		await page.waitForFunction(n => document.querySelectorAll('[data-testid="attachment-chip"]').length === n, {}, paths.length);
+		const chipText = await page.$$eval('[data-testid="attachment-chip"]', els => els.map(e => e.textContent));
+		assert.deepEqual(chipText, names);
 
-	await page.evaluate(value => {
-		const textarea = document.querySelector('[data-testid="composer"] textarea');
-		Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value").set.call(textarea, value);
-		textarea.dispatchEvent(new Event("input", { bubbles: true }));
-	}, "teach me from my book");
-	await page.waitForFunction(() => {
-		const button = document.querySelector('button[aria-label="Start session"], [data-testid="composer"] button[aria-label="Send"]');
-		return button && !button.disabled;
-	});
-	await page.locator('button[aria-label="Start session"], [data-testid="composer"] button[aria-label="Send"]').click();
-	await page.waitForFunction(() => /^\/chat\/chat_/.test(location.pathname));
-	await page.waitForFunction(() => document.querySelectorAll('[data-testid="message-attachments"] [data-testid="attachment-chip"]').length === 2);
+		await page.evaluate(value => {
+			const textarea = document.querySelector('[data-testid="composer"] textarea');
+			Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value").set.call(textarea, value);
+			textarea.dispatchEvent(new Event("input", { bubbles: true }));
+		}, text);
+		await page.waitForFunction(() => {
+			const button = document.querySelector('button[aria-label="Start session"], [data-testid="composer"] button[aria-label="Send"]');
+			return button && !button.disabled;
+		});
+		await page.locator('button[aria-label="Start session"], [data-testid="composer"] button[aria-label="Send"]').click();
+		await page.waitForFunction(() => /^\/chat\/chat_/.test(location.pathname));
+		await page.waitForFunction(n => document.querySelectorAll('[data-testid="message-attachments"] [data-testid="attachment-chip"]').length === n, {}, paths.length);
+		return new URL(page.url()).pathname.split("/").at(-1);
+	};
 
-	const chatId = new URL(page.url()).pathname.split("/").at(-1);
+	const chatId = await startSession([epubPath, pngPath], ["book.epub", "figure.png"], "teach me from my book");
 	assert.equal(uploads.length, 2, "one upload request per file");
 	const sent = posts.at(-1);
 	assert.equal(sent.chatId, chatId);
@@ -132,11 +137,19 @@ try {
 	assert.deepEqual(record.attachments.map(a => [a.name, a.kind]), [["book.epub", "epub"], ["figure.png", "image"]]);
 	assert.deepEqual(record.attachments.map(a => a.id), sent.input.attachmentIds);
 	assert.equal(record.attachments[0].chapters, 1);
-	for (const a of record.attachments) assert.ok(fs.existsSync(path.join(dataDir, "attachments", chatId, a.file)), `${a.name} stored`);
+	for (const a of record.attachments) assert.ok(fs.existsSync(path.join(dataDir, "attachments", a.file)), `${a.name} stored`);
 	const shown = await page.$$eval('[data-testid="message-attachments"] [data-testid="attachment-chip"]', els => els.map(e => e.textContent));
 	assert.deepEqual(shown, ["book.epub", "figure.png"]);
-	assert.deepEqual(errors, []);
 	console.log("✓ new session: 2 files picked → chips → uploaded to the session → ids on the opening message → chips in the transcript");
+
+	const secondId = await startSession([epubPath], ["book.epub"], "quiz me on my book");
+	assert.notEqual(secondId, chatId);
+	const second = JSON.parse(fs.readFileSync(path.join(dataDir, "chats", `${secondId}.json`), "utf-8"));
+	assert.equal(second.attachments.length, 1);
+	assert.equal(second.attachments[0].file, record.attachments[0].file, "the same book points at the same stored file");
+	assert.equal(fs.readdirSync(path.join(dataDir, "attachments")).length, 2, "3 attachments across 2 sessions, 2 files stored");
+	assert.deepEqual(errors, []);
+	console.log("✓ second session: the same book attached again is stored once, shared by both sessions");
 } catch (err) {
 	console.error(logs.slice(-4000));
 	throw err;

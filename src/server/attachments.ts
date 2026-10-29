@@ -7,13 +7,14 @@ import {
 } from "../core/contracts.ts";
 import { epubInfo } from "../agent/subagents/epub-ops.ts";
 import { pdfInfo } from "../agent/subagents/pdf-ops.ts";
-import { attachmentPath, removeAttachmentFile, writeAttachmentFile } from "../store/attachments.ts";
+import { blobPath, pinBlob, removeBlobsUnreferenced, unpinBlob, writeBlob } from "../store/attachments.ts";
 import { stores } from "./stores.ts";
 
 /**
  * Session context attachments (2026-10-29) — the upload orchestration
  * behind POST /api/chats/[id]/attachments. Each file is validated (type,
- * size), copied into the chat's attachments dir, and INSPECTED once (PDF
+ * size), stored as a content-addressed blob (the same bytes attached
+ * twice — any sessions — are kept once), and INSPECTED once (PDF
  * page count, EPUB chapters + title — which also refuses DRM and broken
  * files at the door, never mid-lesson); only then does its record land on
  * the chat. Per-file outcomes, notes-import style: one bad file never
@@ -50,6 +51,7 @@ async function inspect(path: string, kind: AttachmentRecord["kind"]): Promise<Pa
 export async function addChatAttachments(chatId: string, files: UploadedFile[]): Promise<AttachmentUploadResult[]> {
 	const results: AttachmentUploadResult[] = [];
 	const accepted: AttachmentRecord[] = [];
+	const pinned: string[] = [];
 	for (const [requestIndex, { name, bytes }] of files.entries()) {
 		const ext = attachmentExtension(name);
 		const type = ATTACHMENT_TYPES[ext];
@@ -61,12 +63,20 @@ export async function addChatAttachments(chatId: string, files: UploadedFile[]):
 			results.push({ requestIndex, name, ok: false, error: `File is larger than ${formatMb(ATTACHMENT_MAX_BYTES)}.` });
 			continue;
 		}
-		const id = `att_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`;
-		const file = writeAttachmentFile(chatId, id, ext, bytes);
+		const file = writeBlob(bytes, ext);
+		// Already on this chat (same bytes, same type): hand back that record
+		// instead of a second manifest line.
+		const existing = [...(stores.chatStore.getChat(chatId)?.attachments ?? []), ...accepted].find((a) => a.file === file);
+		if (existing) {
+			results.push({ requestIndex, name, ok: true, attachment: existing });
+			continue;
+		}
+		pinBlob(file);
+		pinned.push(file);
 		try {
-			const facts = await inspect(attachmentPath(chatId, { file }), type.kind);
+			const facts = await inspect(blobPath(file), type.kind);
 			const attachment: AttachmentRecord = {
-				id,
+				id: `att_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`,
 				name,
 				kind: type.kind,
 				mimeType: type.mimeType,
@@ -78,10 +88,16 @@ export async function addChatAttachments(chatId: string, files: UploadedFile[]):
 			accepted.push(attachment);
 			results.push({ requestIndex, name, ok: true, attachment });
 		} catch (err) {
-			removeAttachmentFile(chatId, file);
 			results.push({ requestIndex, name, ok: false, error: err instanceof Error ? err.message : String(err) });
 		}
 	}
-	if (accepted.length > 0) stores.chatStore.addAttachments(chatId, accepted);
+	try {
+		if (accepted.length > 0) stores.chatStore.addAttachments(chatId, accepted);
+	} finally {
+		for (const file of pinned) unpinBlob(file);
+		// A refused file's blob goes (or every one, if the chat vanished
+		// mid-upload) — unless some chat already holds the same bytes.
+		if (pinned.length > 0) removeBlobsUnreferenced(pinned, stores.chatStore.referencedAttachmentFiles());
+	}
 	return results;
 }

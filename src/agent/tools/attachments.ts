@@ -7,18 +7,19 @@ import type { AttachmentRecord } from "../../core/contracts.ts";
 import { serverExecute } from "../tool-execute.ts";
 import { epubChapterMarkdown, epubInfo, epubSearch } from "../subagents/epub-ops.ts";
 import { pdfExtract, pdfInfo, pdfSearch } from "../subagents/pdf-ops.ts";
-import { capOutput, formatSize, scopedPath } from "./fs-shared.ts";
+import { capOutput, formatSize } from "./fs-shared.ts";
 import { readTextSlice } from "./read.ts";
 
 /**
  * Session context attachments (2026-10-29) — the agent side. The learner
- * attaches images, PDFs and EPUBs from the composer; the server copies
- * them into the chat's attachments dir. Here:
+ * attaches images, PDFs and EPUBs from the composer; the server stores
+ * them as content-addressed blobs shared across sessions. Here:
  *
  * - attachmentsPromptSection: the system prompt's manifest, rebuilt every
  *   turn from the record (survives compaction and resume), stable while
  *   the list is unchanged so prompt caching holds;
- * - attachmentTools: paged readers scoped to the attachments dir — pdf_*
+ * - attachmentTools: paged readers scoped to THIS session's records (the
+ *   blob root holds every session's files, so a dir check isn't enough) — pdf_*
  *   (pdf-ops, the researcher's text layer) and epub_* (epub-ops). The
  *   agent reads slices on demand, Claude Code style; nothing is inlined;
  * - attachmentImageParts: the wire hook that shows an image to a vision
@@ -29,7 +30,7 @@ import { readTextSlice } from "./read.ts";
  */
 
 export interface SessionAttachments {
-	/** The chat's attachments directory (absolute). */
+	/** The blob root every record's `file` resolves against (absolute). */
 	dir: string;
 	records: AttachmentRecord[];
 }
@@ -84,6 +85,11 @@ export function attachmentTools(attachments: SessionAttachments | undefined): Re
 	if (!attachments) return {};
 	const { dir, records } = attachments;
 	const tools: Record<string, AgentTool<any>> = {};
+	const own = new Set(records.map((r) => path.join(dir, r.file)));
+	const scoped = (p: string): string | null => {
+		const resolved = path.resolve(p);
+		return own.has(resolved) ? resolved : null;
+	};
 	const outside = (tool: string) => `${tool} failed: the path must be one of this session's attachments`;
 
 	if (records.some((r) => r.kind === "pdf")) {
@@ -99,10 +105,10 @@ export function attachmentTools(attachments: SessionAttachments | undefined): Re
 			description: "Triage an attached PDF: page count plus per-page signals (text_length, image_count, math_density).",
 			parameters: infoInput,
 			execute: serverExecute("pdf_info", infoInput, async ({ path: p }) => {
-				const scoped = scopedPath(dir, p);
-				if (!scoped) return outside("pdf_info");
+				const file = scoped(p);
+				if (!file) return outside("pdf_info");
 				try {
-					const info = await pdfInfo(scoped);
+					const info = await pdfInfo(file);
 					return { page_count: info.page_count, mean_text_length: info.mean_text_length, pages: info.pages };
 				} catch (err) {
 					return failure("pdf_info", err);
@@ -115,10 +121,10 @@ export function attachmentTools(attachments: SessionAttachments | undefined): Re
 			description: `Extract the text of specific pages of an attached PDF. Output is capped at ${formatSize(50 * 1024)} — request fewer pages if it truncates.`,
 			parameters: extractInput,
 			execute: serverExecute("pdf_extract", extractInput, async ({ path: p, pages }) => {
-				const scoped = scopedPath(dir, p);
-				if (!scoped) return outside("pdf_extract");
+				const file = scoped(p);
+				if (!file) return outside("pdf_extract");
 				try {
-					const { content, truncated } = capOutput((await pdfExtract(scoped, pages)).split("\n"));
+					const { content, truncated } = capOutput((await pdfExtract(file, pages)).split("\n"));
 					return truncated ? `${content}\n\n[Output truncated at ${formatSize(50 * 1024)}. Request a narrower page range.]` : content;
 				} catch (err) {
 					return failure("pdf_extract", err);
@@ -131,10 +137,10 @@ export function attachmentTools(attachments: SessionAttachments | undefined): Re
 			description: "Find text in an attached PDF — returns the pages and contexts that hit.",
 			parameters: searchInput,
 			execute: serverExecute("pdf_search", searchInput, async ({ path: p, query }) => {
-				const scoped = scopedPath(dir, p);
-				if (!scoped) return outside("pdf_search");
+				const file = scoped(p);
+				if (!file) return outside("pdf_search");
 				try {
-					return { hits: (await pdfSearch(scoped, query, { literal: true })).hits };
+					return { hits: (await pdfSearch(file, query, { literal: true })).hits };
 				} catch (err) {
 					return failure("pdf_search", err);
 				}
@@ -157,10 +163,10 @@ export function attachmentTools(attachments: SessionAttachments | undefined): Re
 			description: "The structure of an attached EPUB: title, author, and every chapter (number, title, word count) in reading order.",
 			parameters: infoInput,
 			execute: serverExecute("epub_info", infoInput, async ({ path: p }) => {
-				const scoped = scopedPath(dir, p);
-				if (!scoped) return outside("epub_info");
+				const file = scoped(p);
+				if (!file) return outside("epub_info");
 				try {
-					return await epubInfo(scoped);
+					return await epubInfo(file);
 				} catch (err) {
 					return failure("epub_info", err);
 				}
@@ -174,10 +180,10 @@ export function attachmentTools(attachments: SessionAttachments | undefined): Re
 				"use offset/limit to page through a long chapter.",
 			parameters: readInput,
 			execute: serverExecute("epub_read", readInput, async ({ path: p, chapter, offset, limit }) => {
-				const scoped = scopedPath(dir, p);
-				if (!scoped) return outside("epub_read");
+				const file = scoped(p);
+				if (!file) return outside("epub_read");
 				try {
-					return readTextSlice(await epubChapterMarkdown(scoped, chapter), offset, limit);
+					return readTextSlice(await epubChapterMarkdown(file, chapter), offset, limit);
 				} catch (err) {
 					return failure("epub_read", err);
 				}
@@ -189,10 +195,10 @@ export function attachmentTools(attachments: SessionAttachments | undefined): Re
 			description: "Find text in an attached EPUB — returns matching lines with their chapter number, chapter title and nearest heading.",
 			parameters: searchInput,
 			execute: serverExecute("epub_search", searchInput, async ({ path: p, query }) => {
-				const scoped = scopedPath(dir, p);
-				if (!scoped) return outside("epub_search");
+				const file = scoped(p);
+				if (!file) return outside("epub_search");
 				try {
-					const hits = await epubSearch(scoped, query);
+					const hits = await epubSearch(file, query);
 					if (hits.length === 0) return "No matches.";
 					const lines = hits.map((h) => `ch ${h.chapter} (${h.chapterTitle}${h.heading ? ` › ${h.heading}` : ""}): ${h.text}`);
 					return capOutput(lines).content;

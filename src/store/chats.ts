@@ -204,6 +204,28 @@ function addAttachments(id: string, attachments: AttachmentRecord[]): void {
 	writeChat(record);
 }
 
+/** Every attachment blob some chat record names — the sweep's live set.
+ *  Reads the raw JSON, NOT getChat/listChats: a record this build refuses
+ *  (newer schema) or can't project still holds its files. */
+function referencedAttachmentFiles(): Set<string> {
+	const files = new Set<string>();
+	let names: string[] = [];
+	try {
+		names = fs.readdirSync(PATHS.chats).filter((f) => f.endsWith(".json"));
+	} catch {
+		return files;
+	}
+	for (const name of names) {
+		try {
+			const record = JSON.parse(fs.readFileSync(path.join(PATHS.chats, name), "utf-8")) as { attachments?: Array<{ file?: unknown }> };
+			for (const a of record.attachments ?? []) if (typeof a.file === "string") files.add(a.file);
+		} catch {
+			// Unreadable record: nothing to learn from it.
+		}
+	}
+	return files;
+}
+
 /** Persist the session plan tree (plan tools call this in execute). */
 function saveTree(id: string, tree: PlanTree): void {
 	const record = getChat(id);
@@ -224,6 +246,7 @@ export const chatStore: ChatStore = {
 	renameChat,
 	deleteChat,
 	addAttachments,
+	referencedAttachmentFiles,
 	appendTurnUsage,
 	appendExtractionUsage,
 };

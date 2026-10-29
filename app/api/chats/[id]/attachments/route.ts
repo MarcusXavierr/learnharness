@@ -4,7 +4,7 @@ import { ATTACHMENT_MAX_BYTES } from "@/src/core";
 /**
  * POST /api/chats/[id]/attachments — session context attachments
  * (2026-10-29). Multipart field "files" (the notes-import shape); each file
- * is validated, copied into the chat's attachments dir, inspected, and
+ * is validated, stored once by content (shared blob store), inspected, and
  * recorded on the chat. Per-file results ({requestIndex, ok, attachment |
  * error}) so one bad file never sinks the others. The composer uploads one
  * file per request: proxy.ts buffers bodies up to next.config's

@@ -15,7 +15,7 @@ import { handleChatRequest } from "../src/server/chat-handler.ts";
 import { deleteChatSession } from "../src/server/chats.ts";
 import { runningTurn } from "../src/server/turn-runs.ts";
 import { chatStore } from "../src/store/chats.ts";
-import { attachmentsDir } from "../src/store/attachments.ts";
+import { attachmentsRoot, removeBlobsUnreferenced } from "../src/store/attachments.ts";
 import { newCompactionMarker } from "../src/core/compaction.ts";
 import type { AttachmentRecord } from "../src/core/contracts.ts";
 import type { PiEngine } from "../src/agent/models.ts";
@@ -63,12 +63,20 @@ function scripted(steps: ((seen: Seen) => ReturnType<typeof fauxAssistantMessage
 }
 
 const createdChats: string[] = [];
+const createdBlobs = new Set<string>();
 after(() => {
-	for (const id of createdChats) {
-		fs.rmSync(path.join(PATHS.chats, `${id}.json`), { force: true });
-		fs.rmSync(attachmentsDir(id), { recursive: true, force: true });
-	}
+	for (const id of createdChats) fs.rmSync(path.join(PATHS.chats, `${id}.json`), { force: true });
+	removeBlobsUnreferenced(createdBlobs, chatStore.referencedAttachmentFiles());
 });
+
+/** The blob store's contents (every session's attached files, stored once). */
+function blobs(): string[] {
+	try {
+		return fs.readdirSync(attachmentsRoot()).sort();
+	} catch {
+		return [];
+	}
+}
 
 function newChat(): string {
 	const chat = chatStore.createChat("Test: attachments");
@@ -91,7 +99,8 @@ async function upload(chatId: string, name: string, bytes: Uint8Array) {
 async function attach(chatId: string, name: string, bytes: Uint8Array): Promise<{ record: AttachmentRecord; path: string }> {
 	const result = await upload(chatId, name, bytes);
 	assert.ok(result.ok, result.error);
-	return { record: result.attachment!, path: path.join(attachmentsDir(chatId), result.attachment!.file) };
+	createdBlobs.add(result.attachment!.file);
+	return { record: result.attachment!, path: path.join(attachmentsRoot(), result.attachment!.file) };
 }
 
 /** Send one learner message and run the turn to completion. */
@@ -208,7 +217,7 @@ describe("session attachments (upload route → turn)", () => {
 		assert.equal(res.status, 400);
 	});
 
-	it("survives compaction and resume; deleting the session removes its files", async () => {
+	it("survives compaction and resume; deleting the session removes the files only it held", async () => {
 		const chatId = newChat();
 		const image = await attach(chatId, "diagram.png", PNG);
 		const book = await attach(chatId, "mechanics.epub", makeEpub({ chapters: [{ title: "Only", body: "<p>x</p>" }] }));
@@ -237,6 +246,82 @@ describe("session attachments (upload route → turn)", () => {
 		assert.ok(fs.existsSync(book.path));
 		const outcome = await deleteChatSession(chatId, "preserve-graph");
 		assert.ok(outcome.ok);
-		assert.equal(fs.existsSync(attachmentsDir(chatId)), false);
+		assert.equal(fs.existsSync(book.path), false);
+	});
+
+	it("stores a file attached to two sessions once, and frees it only when the last session goes", async () => {
+		const bytes = makeEpub({ title: `Shared ${Date.now()}`, chapters: [{ title: "Waves", body: "<h1>Waves</h1><p>A wave carries energy.</p>" }] });
+		const before = blobs();
+		const a = newChat();
+		const b = newChat();
+		const inA = await attach(a, "waves.epub", bytes);
+		const inB = await attach(b, "waves (copy).epub", bytes);
+		assert.equal(inA.path, inB.path, "both sessions point at the same stored file");
+		assert.equal(blobs().length, before.length + 1, "the bytes are stored once");
+
+		const again = await attach(a, "waves.epub", bytes);
+		assert.equal(again.record.id, inA.record.id, "re-attaching to the same session returns the existing attachment");
+		assert.equal(chatStore.getChat(a)!.attachments!.length, 1);
+
+		const readIn = async (chatId: string, filePath: string) => {
+			const { engine, seen } = scripted([
+				() => fauxAssistantMessage([fauxToolCall("epub_read", { path: filePath, chapter: 1 })], { stopReason: "toolUse" }),
+				() => fauxAssistantMessage([fauxText("Read.")]),
+			]);
+			await send(chatId, engine, "read my book");
+			return lastToolResult(seen[1]!);
+		};
+		assert.match(await readIn(a, inA.path), /A wave carries energy/);
+		assert.ok((await deleteChatSession(a, "preserve-graph")).ok);
+		assert.ok(fs.existsSync(inB.path), "the other session still holds the file");
+		assert.match(await readIn(b, inB.path), /A wave carries energy/);
+		assert.ok((await deleteChatSession(b, "preserve-graph")).ok);
+		assert.equal(fs.existsSync(inB.path), false, "no session holds it any more");
+		assert.deepEqual(blobs(), before);
+	});
+
+	it("keeps each session's readers to its own files, even though the store is shared", async () => {
+		const mine = newChat();
+		const theirs = newChat();
+		const own = await attach(mine, "own.epub", makeEpub({ title: `Own ${Date.now()}`, chapters: [{ title: "A", body: "<p>own</p>" }] }));
+		const other = await attach(theirs, "private.epub", makeEpub({ title: `Private ${Date.now()}`, chapters: [{ title: "B", body: "<p>secret</p>" }] }));
+
+		const { engine, seen } = scripted([
+			() => fauxAssistantMessage([fauxToolCall("epub_read", { path: other.path, chapter: 1 })], { stopReason: "toolUse" }),
+			() => fauxAssistantMessage([fauxText("Done.")]),
+		]);
+		await send(mine, engine, "read");
+		assert.match(lastToolResult(seen[1]!), /must be one of this session's attachments/);
+		assert.doesNotMatch(lastToolResult(seen[1]!), /secret/);
+		assert.ok(seen[0]!.systemPrompt.includes(`own.epub — EPUB`) && seen[0]!.systemPrompt.includes(`path: ${own.path}`));
+		assert.doesNotMatch(seen[0]!.systemPrompt, /private\.epub/);
+		assert.ok(!seen[0]!.systemPrompt.includes(other.record.file), "another session's file is not in the manifest");
+	});
+
+	it("leaves nothing stored when a file is refused at the door", async () => {
+		const chatId = newChat();
+		const before = blobs();
+		const drm = await upload(chatId, "locked.epub", makeEpub({ encrypted: true, chapters: [{ title: "A", body: "<p>x</p>" }] }));
+		assert.equal(drm.ok, false);
+		assert.deepEqual(blobs(), before);
+		assert.equal(chatStore.getChat(chatId)!.attachments, undefined);
+	});
+
+	it("still runs the turn when an attached image is missing from disk", async () => {
+		const chatId = newChat();
+		const image = await attach(chatId, "diagram.png", PNG);
+		// A record whose file isn't there (an older layout, or removed by hand).
+		const record = chatStore.getChat(chatId)!;
+		record.attachments = record.attachments!.map((a) => ({ ...a, file: "att_legacy.png" }));
+		fs.writeFileSync(path.join(PATHS.chats, `${chatId}.json`), JSON.stringify(record));
+
+		const { engine, seen } = scripted([() => fauxAssistantMessage([fauxText("Go ahead and describe it.")])]);
+		await send(chatId, engine, "what is in this diagram?", [image.record.id]);
+		assert.equal(seen.length, 1, "the turn reached the model");
+		assert.match(seen[0]!.systemPrompt, /diagram\.png — image/);
+		const user = seen[0]!.messages.find((m) => m.role === "user")!;
+		const parts = typeof user.content === "string" ? [{ type: "text" }] : (user.content as Array<{ type: string }>);
+		assert.ok(!parts.some((p) => p.type === "image"), "a missing image is skipped, not sent");
+		assert.equal(chatStore.getChat(chatId)!.messages.at(-1)!.role, "assistant");
 	});
 });

@@ -8,7 +8,7 @@ import * as path from "node:path";
  * itself, so paths need no UI affordance (user decision, 2026-09: the
  * learner references files in messages; the agent finds them). Since
  * 2026-10-29 the learner can ALSO attach files from the composer — those
- * are copied into the session and read by the scoped tools in
+ * are stored once by content and read by the record-scoped tools in
  * attachments.ts; these tools stay the path for everything else.
  *
  * Safety posture (user-locked): READ-ONLY by construction — no shell-out,

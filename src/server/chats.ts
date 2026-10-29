@@ -4,7 +4,7 @@ import { coverageOf } from "../core/coverage.ts";
 import { deleteChatTraces, type ChatDeleteMode, type ChatDeletionStats } from "../core/graph-deletion.ts";
 import { titleFromPrompt } from "../core/contracts.ts";
 import { graphRevision } from "./graph.ts";
-import { deleteAttachmentsDir } from "../store/attachments.ts";
+import { removeBlobsUnreferenced } from "../store/attachments.ts";
 import { stores } from "./stores.ts";
 import { isTurnRunning } from "./turn-liveness.ts";
 import { clearTurnFailure } from "./turn-runs.ts";
@@ -127,10 +127,12 @@ export async function deleteChatSession(chatId: string, mode: ChatDeleteMode): P
 	// ledgers → jobs → the chat record.
 	const stats = deleteChatTraces(stores.graphStore, chatId, mode);
 	const jobsRemoved = stores.jobStore.deleteJobsForChat(chatId);
+	const blobs = (stores.chatStore.getChat(chatId)?.attachments ?? []).map((a) => a.file);
 	if (stores.chatStore.deleteChat(chatId)) {
 		discardChatDeliveries(chatId);
 		clearTurnFailure(chatId);
-		deleteAttachmentsDir(chatId);
+		// Shared blobs stay while another session still attaches them.
+		if (blobs.length > 0) removeBlobsUnreferenced(blobs, stores.chatStore.referencedAttachmentFiles());
 	}
 	return { ok: true, mode, stats, jobsRemoved, graphRevision: graphRevision() };
 }
