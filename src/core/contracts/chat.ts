@@ -55,7 +55,8 @@ export interface ChatRecord {
 	/** Session context attachments (2026-10-29): files the learner attached
 	 *  from the composer, stored once by content under data/attachments/. The agent
 	 *  sees them through the system prompt's attachments section and reads
-	 *  them on demand — contents never ride the record. Append-only. */
+	 *  them on demand — contents never ride the record. Records are never
+	 *  deleted: removal sets `detachedAt`, Undo clears it. */
 	attachments?: AttachmentRecord[];
 	/** SCHEMA STAMP (schema-versioning wave, owner 2026-10-10): LAZY v1 —
 	 *  existing records stay unstamped (absence reads as v1); every write
@@ -85,6 +86,8 @@ export interface AttachmentRecord {
 	chapters?: number;
 	/** EPUB title metadata. */
 	title?: string;
+	/** Set when the learner removed the file from the session's context (ISO time); absent = active. The record and its blob stay so Undo needs no re-upload. */
+	detachedAt?: string;
 }
 
 /** Accepted attachment types by extension — single-sourced for the

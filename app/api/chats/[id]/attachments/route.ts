@@ -1,14 +1,13 @@
-import { addChatAttachments, getChat } from "@/src/server";
+import { addChatAttachment, getChat } from "@/src/server";
 import { ATTACHMENT_MAX_BYTES } from "@/src/core";
 
 /**
  * POST /api/chats/[id]/attachments — session context attachments
- * (2026-10-29). Multipart field "files" (the notes-import shape); each file
- * is validated, stored once by content (shared blob store), inspected, and
- * recorded on the chat. Per-file results ({requestIndex, ok, attachment |
- * error}) so one bad file never sinks the others. The composer uploads one
- * file per request: proxy.ts buffers bodies up to next.config's
- * proxyClientMaxBodySize, sized for one ATTACHMENT_MAX_BYTES file.
+ * (2026-10-29). Multipart field "file": exactly one file per request,
+ * because proxy.ts buffers bodies up to next.config's
+ * proxyClientMaxBodySize, sized for one ATTACHMENT_MAX_BYTES file. The
+ * file is validated, stored once by content (shared blob store),
+ * inspected, and recorded on the chat: 200 {attachment} or 422 {error}.
  */
 export async function POST(req: Request, { params }: { params: Promise<{ id: string }> }) {
 	const { id } = await params;
@@ -23,8 +22,8 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
 	} catch {
 		return Response.json({ error: "Invalid upload body" }, { status: 400 });
 	}
-	const files = form.getAll("files").filter((f): f is File => f instanceof File);
-	if (files.length === 0) return Response.json({ error: "no files" }, { status: 400 });
-	const uploads = await Promise.all(files.map(async (f) => ({ name: f.name, bytes: new Uint8Array(await f.arrayBuffer()) })));
-	return Response.json({ results: await addChatAttachments(id, uploads) });
+	const upload = form.get("file");
+	if (!(upload instanceof File)) return Response.json({ error: 'Attach one file in the "file" field.' }, { status: 400 });
+	const result = await addChatAttachment(id, { name: upload.name, bytes: new Uint8Array(await upload.arrayBuffer()) });
+	return result.ok ? Response.json({ attachment: result.attachment }) : Response.json({ error: result.error }, { status: 422 });
 }

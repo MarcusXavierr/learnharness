@@ -45,9 +45,8 @@ import { applyParkedDismissal } from "./dismissal-park.ts";
 import { registerTurn, rememberTurnFailure, unregisterTurn } from "./turn-runs.ts";
 import { persistTurn, triggerExtraction, TurnPersistenceError } from "./turn-service.ts";
 import { hasProbeDone, danglingQuestionOf } from "../core/native-messages.ts";
-import { composeInstructions } from "../agent/teacher-agent.ts";
-import { attachmentsPromptSection, type SessionAttachments } from "../agent/tools/attachments.ts";
-import { attachmentsRoot } from "../store/attachments.ts";
+import { systemPromptFor } from "../agent/teacher-agent.ts";
+import { sessionAttachments } from "./attachments.ts";
 import { ensureCompacted, kickCompaction, effectiveThresholdTokens } from "./compaction.ts";
 import { catalogContextLimits, refreshConnectionCatalog } from "./model-catalog.ts";
 import { emit } from "../core/events.ts";
@@ -82,15 +81,10 @@ import type { CallUsage, ChatRecord } from "../core/contracts.ts";
  * for write-ahead persistence, turn liveness, and the turn services.
  */
 
-/** The session's attachments as the agent layer sees them (blob root + records). */
-function sessionAttachments(record: ChatRecord): SessionAttachments | undefined {
-	return record.attachments?.length ? { dir: attachmentsRoot(), records: record.attachments } : undefined;
-}
-
 /** The compaction estimate's system-prompt share: doctrine + attachments manifest. */
 function systemPromptTokens(record: ChatRecord): number {
 	const kind = record.kind === "practice" ? "practice" : "teacher";
-	return Math.ceil((composeInstructions(kind).length + attachmentsPromptSection(sessionAttachments(record)).length) / 4);
+	return Math.ceil(systemPromptFor(kind, { attachments: sessionAttachments(record) }).length / 4);
 }
 
 function settlementErrorText(error: unknown): string {

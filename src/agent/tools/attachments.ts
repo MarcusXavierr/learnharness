@@ -12,8 +12,9 @@ import { readTextSlice } from "./read.ts";
 
 /**
  * Session context attachments (2026-10-29) — the agent side. The learner
- * attaches images, PDFs and EPUBs from the composer; the server stores
- * them as content-addressed blobs shared across sessions. Here:
+ * attaches images, PDFs and EPUBs; the server resolves the session's
+ * ACTIVE files to absolute paths (SessionAttachment) — the agent never
+ * learns where blobs live or which files were removed. Here:
  *
  * - attachmentsPromptSection: the system prompt's manifest, rebuilt every
  *   turn from the record (survives compaction and resume), stable while
@@ -29,22 +30,23 @@ import { readTextSlice } from "./read.ts";
  * never throw into the agent loop.
  */
 
-export interface SessionAttachments {
-	/** The blob root every record's `file` resolves against (absolute). */
-	dir: string;
-	records: AttachmentRecord[];
+/** One active session attachment, resolved by the server: the record plus where its bytes live. */
+export interface SessionAttachment {
+	record: AttachmentRecord;
+	/** Absolute path of the stored file. */
+	path: string;
 }
 
 function describe(a: AttachmentRecord): string {
 	const size = formatSize(a.bytes);
 	if (a.kind === "pdf") return `PDF, ${a.pages ?? "?"} pages, ${size} → pdf_info / pdf_search / pdf_extract; the \`pdf\` job for figures and equations`;
 	if (a.kind === "epub") return `EPUB${a.title ? ` "${a.title}"` : ""}, ${a.chapters ?? "?"} chapters, ${size} → epub_info / epub_search / epub_read`;
-	return `image, ${size} → shown on the message it was sent with; \`read\` to look again`;
+	return `image, ${size} → \`read\` this path to look at it (also shown on the message it was sent with, when there is one)`;
 }
 
-export function attachmentsPromptSection(attachments: SessionAttachments | undefined): string {
-	if (!attachments?.records.length) return "";
-	const lines = attachments.records.map((a) => `- ${a.name} — ${describe(a)} — path: ${path.join(attachments.dir, a.file)}`);
+export function attachmentsPromptSection(attachments: readonly SessionAttachment[]): string {
+	if (attachments.length === 0) return "";
+	const lines = attachments.map((a) => `- ${a.record.name} — ${describe(a.record)} — path: ${a.path}`);
 	return [
 		"## Session attachments",
 		"",
@@ -58,15 +60,14 @@ export function attachmentsPromptSection(attachments: SessionAttachments | undef
 
 /** Image content for the ids attached to one message (vision models only;
  *  unreadable files drop silently — the manifest still names them). */
-export function attachmentImageParts(attachments: SessionAttachments | undefined) {
+export function attachmentImageParts(attachments: readonly SessionAttachment[]) {
 	return (ids: readonly string[]): ImageContent[] => {
-		if (!attachments) return [];
 		const parts: ImageContent[] = [];
 		for (const id of ids) {
-			const a = attachments.records.find((r) => r.id === id && r.kind === "image");
+			const a = attachments.find((r) => r.record.id === id && r.record.kind === "image");
 			if (!a) continue;
 			try {
-				parts.push({ type: "image", mimeType: a.mimeType, data: fs.readFileSync(path.join(attachments.dir, a.file)).toString("base64") });
+				parts.push({ type: "image", mimeType: a.record.mimeType, data: fs.readFileSync(a.path).toString("base64") });
 			} catch {
 				// File gone from disk: the image simply isn't shown.
 			}
@@ -81,18 +82,17 @@ function failure(tool: string, err: unknown): string {
 	return `${tool} failed: ${err instanceof Error ? err.message : String(err)}`;
 }
 
-export function attachmentTools(attachments: SessionAttachments | undefined): Record<string, AgentTool<any>> {
-	if (!attachments) return {};
-	const { dir, records } = attachments;
+export function attachmentTools(attachments: readonly SessionAttachment[]): Record<string, AgentTool<any>> {
+	if (attachments.length === 0) return {};
 	const tools: Record<string, AgentTool<any>> = {};
-	const own = new Set(records.map((r) => path.join(dir, r.file)));
+	const own = new Set(attachments.map((a) => a.path));
 	const scoped = (p: string): string | null => {
 		const resolved = path.resolve(p);
 		return own.has(resolved) ? resolved : null;
 	};
 	const outside = (tool: string) => `${tool} failed: the path must be one of this session's attachments`;
 
-	if (records.some((r) => r.kind === "pdf")) {
+	if (attachments.some((a) => a.record.kind === "pdf")) {
 		const infoInput = Type.Object({ path: pathParam });
 		const extractInput = Type.Object({
 			path: pathParam,
@@ -148,7 +148,7 @@ export function attachmentTools(attachments: SessionAttachments | undefined): Re
 		};
 	}
 
-	if (records.some((r) => r.kind === "epub")) {
+	if (attachments.some((a) => a.record.kind === "epub")) {
 		const infoInput = Type.Object({ path: pathParam });
 		const readInput = Type.Object({
 			path: pathParam,

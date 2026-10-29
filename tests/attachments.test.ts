@@ -23,6 +23,7 @@ import { PATHS } from "../config.ts";
 import { makeEpub } from "./fixtures/make-epub.ts";
 
 const attachmentsRoute = await import("../app/api/chats/[id]/attachments/route.ts");
+const attachmentRoute = await import("../app/api/chats/[id]/attachments/[attachmentId]/route.ts");
 
 process.env.OPENROUTER_API_KEY ??= "test-key-presence-gate";
 
@@ -87,13 +88,12 @@ function newChat(): string {
 
 async function upload(chatId: string, name: string, bytes: Uint8Array) {
 	const form = new FormData();
-	form.append("files", new File([Buffer.from(bytes)], name));
+	form.append("file", new File([Buffer.from(bytes)], name));
 	const res = await attachmentsRoute.POST(new Request(`http://local/api/chats/${chatId}/attachments`, { method: "POST", body: form }), {
 		params: Promise.resolve({ id: chatId }),
 	});
-	assert.equal(res.status, 200);
-	const { results } = (await res.json()) as { results: Array<{ ok: boolean; attachment?: AttachmentRecord; error?: string }> };
-	return results[0]!;
+	assert.ok(res.status === 200 || res.status === 422, `unexpected HTTP ${res.status}`);
+	return { ok: res.status === 200, ...(await res.json()) } as { ok: boolean; attachment?: AttachmentRecord; error?: string };
 }
 
 async function attach(chatId: string, name: string, bytes: Uint8Array): Promise<{ record: AttachmentRecord; path: string }> {
@@ -101,6 +101,23 @@ async function attach(chatId: string, name: string, bytes: Uint8Array): Promise<
 	assert.ok(result.ok, result.error);
 	createdBlobs.add(result.attachment!.file);
 	return { record: result.attachment!, path: path.join(attachmentsRoot(), result.attachment!.file) };
+}
+
+function patchRequest(chatId: string, attachmentId: string, body: unknown): Promise<Response> {
+	return attachmentRoute.PATCH(
+		new Request(`http://local/api/chats/${chatId}/attachments/${attachmentId}`, {
+			method: "PATCH",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(body),
+		}),
+		{ params: Promise.resolve({ id: chatId, attachmentId }) },
+	);
+}
+
+async function detach(chatId: string, attachmentId: string, detached: boolean): Promise<AttachmentRecord> {
+	const res = await patchRequest(chatId, attachmentId, { detached });
+	assert.equal(res.status, 200);
+	return ((await res.json()) as { attachment: AttachmentRecord }).attachment;
 }
 
 /** Send one learner message and run the turn to completion. */
@@ -323,5 +340,81 @@ describe("session attachments (upload route → turn)", () => {
 		const parts = typeof user.content === "string" ? [{ type: "text" }] : (user.content as Array<{ type: string }>);
 		assert.ok(!parts.some((p) => p.type === "image"), "a missing image is skipped, not sent");
 		assert.equal(chatStore.getChat(chatId)!.messages.at(-1)!.role, "assistant");
+	});
+
+	it("a removed file leaves the next turn's context; Undo brings it back; the stored copy stays until the session goes", async () => {
+		const chatId = newChat();
+		const book = await attach(
+			chatId,
+			"mechanics.epub",
+			makeEpub({ title: `Detach ${Date.now()}`, chapters: [{ title: "Kinematics", body: "<p>Velocity is the rate of change of position.</p>" }] }),
+		);
+		const image = await attach(chatId, "diagram.png", PNG);
+		const first = scripted([() => fauxAssistantMessage([fauxText("Seen.")])]);
+		await send(chatId, first.engine, "look at this", [image.record.id]);
+
+		const removed = await detach(chatId, book.record.id, true);
+		assert.ok(removed.detachedAt);
+		const afterRemove = scripted([
+			() => fauxAssistantMessage([fauxToolCall("epub_read", { path: book.path, chapter: 1 })], { stopReason: "toolUse" }),
+			() => fauxAssistantMessage([fauxText("Done.")]),
+		]);
+		await send(chatId, afterRemove.engine, "read my book");
+		assert.doesNotMatch(afterRemove.seen[0]!.systemPrompt, /mechanics\.epub/);
+		assert.ok(!afterRemove.seen[0]!.tools.includes("epub_read"), "no active EPUB, no EPUB reader");
+		assert.match(lastToolResult(afterRemove.seen[1]!), /epub_read/);
+		assert.doesNotMatch(lastToolResult(afterRemove.seen[1]!), /Velocity/);
+		assert.ok(fs.existsSync(book.path), "a removed file's stored copy stays for Undo");
+
+		await detach(chatId, image.record.id, true);
+		const noImage = scripted([() => fauxAssistantMessage([fauxText("Ok.")])]);
+		await send(chatId, noImage.engine, "continue");
+		const imageMessage = noImage.seen[0]!.messages.find((m) => m.role === "user")!;
+		const parts = typeof imageMessage.content === "string" ? [{ type: "text" }] : (imageMessage.content as Array<{ type: string }>);
+		assert.ok(!parts.some((p) => p.type === "image"), "a removed image is no longer shown on its message");
+
+		await detach(chatId, book.record.id, false);
+		const restored = scripted([() => fauxAssistantMessage([fauxText("Back.")])]);
+		await send(chatId, restored.engine, "and now?");
+		assert.match(restored.seen[0]!.systemPrompt, /mechanics\.epub — EPUB/);
+
+		assert.ok((await deleteChatSession(chatId, "preserve-graph")).ok);
+		assert.equal(fs.existsSync(book.path), false);
+	});
+
+	it("attaching the same bytes again restores a removed file under the same id", async () => {
+		const chatId = newChat();
+		const bytes = makeEpub({ title: `Reattach ${Date.now()}`, chapters: [{ title: "A", body: "<p>x</p>" }] });
+		const first = await attach(chatId, "notes.epub", bytes);
+		await detach(chatId, first.record.id, true);
+		const again = await attach(chatId, "notes.epub", bytes);
+		assert.equal(again.record.id, first.record.id);
+		assert.equal(again.record.detachedAt, undefined);
+		assert.equal(chatStore.getChat(chatId)!.attachments!.length, 1);
+		assert.equal(chatStore.getChat(chatId)!.attachments![0]!.detachedAt, undefined);
+	});
+
+	it("answers bad attachment requests with the right status", async () => {
+		const chatId = newChat();
+		const image = await attach(chatId, "diagram.png", PNG);
+		const post = (id: string, form: FormData) =>
+			attachmentsRoute.POST(new Request(`http://local/api/chats/${id}/attachments`, { method: "POST", body: form }), {
+				params: Promise.resolve({ id }),
+			});
+		const textFile = new FormData();
+		textFile.append("file", new File(["hello"], "notes.txt"));
+		const cases: Array<{ name: string; res: () => Promise<Response>; status: number; error?: RegExp }> = [
+			{ name: "unknown attachment", res: () => patchRequest(chatId, "att_nope", { detached: true }), status: 404 },
+			{ name: "non-boolean detached", res: () => patchRequest(chatId, image.record.id, { detached: "yes" }), status: 400 },
+			{ name: "unknown chat", res: () => patchRequest("chat_nope", image.record.id, { detached: true }), status: 404 },
+			{ name: "no file field", res: () => post(chatId, new FormData()), status: 400 },
+			{ name: "unsupported type", res: () => post(chatId, textFile), status: 422, error: /Unsupported file type/ },
+		];
+		for (const c of cases) {
+			const res = await c.res();
+			assert.equal(res.status, c.status, c.name);
+			if (c.error) assert.match(((await res.json()) as { error: string }).error, c.error, c.name);
+		}
+		assert.equal(chatStore.getChat(chatId)!.attachments![0]!.detachedAt, undefined, "a refused request changes nothing");
 	});
 });

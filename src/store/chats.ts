@@ -204,6 +204,28 @@ function addAttachments(id: string, attachments: AttachmentRecord[]): void {
 	writeChat(record);
 }
 
+/** Detach (soft-remove) or restore one attachment record; idempotent —
+ *  detaching twice keeps the first time. Null (no write) when the id isn't
+ *  on the chat. Not conversation activity: updatedAt stays put. */
+function setAttachmentDetached(id: string, attachmentId: string, detached: boolean): AttachmentRecord | null {
+	const record = getChat(id);
+	if (!record) throw new Error(`Chat not found: ${id}`);
+	const attachments = record.attachments ?? [];
+	const index = attachments.findIndex((a) => a.id === attachmentId);
+	if (index === -1) return null;
+	const current = attachments[index]!;
+	let updated: AttachmentRecord;
+	if (detached) {
+		updated = current.detachedAt ? current : { ...current, detachedAt: new Date().toISOString() };
+	} else {
+		const { detachedAt: _detachedAt, ...rest } = current;
+		updated = rest;
+	}
+	record.attachments = attachments.map((a, i) => (i === index ? updated : a));
+	writeChat(record);
+	return updated;
+}
+
 /** Every attachment blob some chat record names — the sweep's live set.
  *  Reads the raw JSON, NOT getChat/listChats: a record this build refuses
  *  (newer schema) or can't project still holds its files. */
@@ -246,6 +268,7 @@ export const chatStore: ChatStore = {
 	renameChat,
 	deleteChat,
 	addAttachments,
+	setAttachmentDetached,
 	referencedAttachmentFiles,
 	appendTurnUsage,
 	appendExtractionUsage,

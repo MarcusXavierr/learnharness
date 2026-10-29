@@ -59,7 +59,7 @@ import { ThinkingCard, type PracticeThinkingData } from "@/components/practice-c
 import { GraphContextCard, type GraphContextData } from "@/components/graph-context-card";
 import { TopBar } from "@/components/top-bar";
 import type { ArtifactPartProps, AttachmentRecord, JobRecord, Phase3, QuestionAnswerData, QuestionFormDraft, TurnUsage, SessionPricing } from "@/src/core";
-import { AttachmentChips, ContextAttachControl, useAttachmentDraft } from "@/components/attachments";
+import { AttachmentChips, ContextAttachControl, mergeAttachments, SessionFilesControl, useAttachmentDraft } from "@/components/attachments";
 import { ComposerActions } from "@/components/composer-actions";
 import type { LhViewMessage } from "@/src/core";
 import { PhaseChip, PhaseDivider } from "@/components/phase-divider";
@@ -249,8 +249,18 @@ export function Chat({
 }) {
 	// Session context attachments: the record's list + the composer's draft.
 	const [sessionAttachments, setSessionAttachments] = useState(initialAttachments);
-	const attachmentDraft = useAttachmentDraft((records) => setSessionAttachments((prev) => [...prev, ...records]));
-	const attachmentName = (id: string) => sessionAttachments.find((a) => a.id === id)?.name ?? "attachment";
+	const attachmentDraft = useAttachmentDraft((records) => setSessionAttachments((prev) => mergeAttachments(prev, records)));
+	const attachmentItem = (id: string) => {
+		const a = sessionAttachments.find((r) => r.id === id);
+		return { id, name: a?.name ?? "attachment", detached: !!a?.detachedAt };
+	};
+	// The top bar's session-files panel; a transcript chip opens it on its file.
+	const [filesOpen, setFilesOpen] = useState(false);
+	const [filesHighlight, setFilesHighlight] = useState<string | null>(null);
+	const onFilesOpenChange = (open: boolean) => {
+		setFilesOpen(open);
+		if (!open) setFilesHighlight(null);
+	};
 	// Reattach plumbing (background-turn runner wave): the hook holds the
 	// settled terminal's callback — a stable ref assigned below, once
 	// syncFromServer exists (refs, not closures: no stale capture).
@@ -1376,6 +1386,16 @@ export function Chat({
 							<div className="min-w-4 flex-1" aria-hidden="true" />
 					</>
 					)}
+					{/* Session files (2026-10-29): every kind — the add path while a
+					    question or probe card blocks the composer. */}
+					<SessionFilesControl
+						chatId={chatId}
+						attachments={sessionAttachments}
+						setAttachments={setSessionAttachments}
+						open={filesOpen}
+						onOpenChange={onFilesOpenChange}
+						highlightId={filesHighlight}
+					/>
 					{/* The plan chip (owner, plan-placement round): session-level
 					    structure beside the phase chip — access to the full-DAG popup
 					    at every width; the marginalia is the wide-screen glance view. */}
@@ -1544,9 +1564,13 @@ export function Chat({
 													{m.parts.filter((p) => p.type === "text").map((p) => p.text).join("\n")}
 												</div>
 												<AttachmentChips
-													names={m.parts
+													items={m.parts
 														.filter((p) => p.type === "data-attachments")
-														.flatMap((p) => (p.data as { ids: string[] }).ids.map(attachmentName))}
+														.flatMap((p) => (p.data as { ids: string[] }).ids.map(attachmentItem))}
+													onOpen={(id) => {
+														setFilesHighlight(id);
+														setFilesOpen(true);
+													}}
 												/>
 											</div>
 									) : (
@@ -1753,7 +1777,7 @@ export function Chat({
 						)
 					}
 					composerActions={
-						<ComposerActions picker={<ContextAttachControl draft={attachmentDraft} disabled={busy || uploading} />} />
+						<ComposerActions picker={<ContextAttachControl draft={attachmentDraft} disabled={busy || uploading} lockRemoval={uploading} />} />
 					}
 					composer={
 						<Composer

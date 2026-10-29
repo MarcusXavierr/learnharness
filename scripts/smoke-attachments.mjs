@@ -142,13 +142,59 @@ try {
 	assert.deepEqual(shown, ["book.epub", "figure.png"]);
 	console.log("✓ new session: 2 files picked → chips → uploaded to the session → ids on the opening message → chips in the transcript");
 
+	// The top bar's session-files panel on the first session: remove, undo, add, close, open from a transcript chip.
+	const readRecord = () => JSON.parse(fs.readFileSync(path.join(dataDir, "chats", `${chatId}.json`), "utf-8"));
+	const until = async (check, what) => {
+		const deadline = Date.now() + 15000;
+		while (!check(readRecord())) {
+			if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+			await new Promise(resolve => setTimeout(resolve, 100));
+		}
+	};
+	const chipText = () => page.$eval('[data-testid="session-files-chip"]', el => el.textContent);
+	// Still on /chat/<chatId>: the opening message (POST intercepted) lives only in this page.
+	await page.waitForSelector('[data-testid="session-files-chip"]');
+	assert.match(await chipText(), /Files · 2/);
+	await page.locator('[data-testid="session-files-chip"]').click();
+	await page.waitForSelector('[data-testid="session-files-panel"]');
+
+	await page.locator('button[aria-label="Remove book.epub"]').click();
+	await until(r => r.attachments[0].detachedAt, "book.epub detached");
+	await page.waitForFunction(() => /Files · 1/.test(document.querySelector('[data-testid="session-files-chip"]').textContent));
+	const bookChip = await page.$eval('[data-testid="message-attachments"] [data-testid="attachment-chip"]', el => el.textContent);
+	assert.match(bookChip, /removed/);
+
+	await page.locator('button[aria-label="Undo removing book.epub"]').click();
+	await until(r => !("detachedAt" in r.attachments[0]), "book.epub restored");
+	await page.waitForFunction(() => /Files · 2/.test(document.querySelector('[data-testid="session-files-chip"]').textContent));
+
+	const postsBefore = posts.length;
+	const panelInput = await page.$('[data-testid="session-files-input"]');
+	await panelInput.uploadFile(path.join(root, "tests/fixtures/sample-3page.pdf"));
+	await until(r => r.attachments.length === 3, "the panel upload");
+	const added = readRecord().attachments[2];
+	assert.equal(added.name, "sample-3page.pdf");
+	assert.equal(added.pages, 3);
+	await page.waitForFunction(() => /Files · 3/.test(document.querySelector('[data-testid="session-files-chip"]').textContent));
+	assert.equal(posts.length, postsBefore, "adding a file sends no message");
+
+	await page.keyboard.press("Escape");
+	await page.waitForFunction(() => !document.querySelector('[data-testid="session-files-panel"]'));
+	assert.equal(await page.evaluate(() => document.activeElement?.getAttribute("data-testid")), "session-files-chip");
+
+	const figureId = readRecord().attachments[1].id;
+	const chips = await page.$$('[data-testid="message-attachments"] [data-testid="attachment-chip"]');
+	await chips[1].click();
+	await page.waitForSelector(`[data-testid="session-files-panel"] [data-attachment-id="${figureId}"][data-highlighted="true"]`);
+	assert.deepEqual(errors, []);
+	console.log("✓ session files: remove → Files · 1 + struck chip → Undo → panel upload (no message sent) → Esc returns focus → transcript chip opens its row");
+
 	const secondId = await startSession([epubPath], ["book.epub"], "quiz me on my book");
 	assert.notEqual(secondId, chatId);
 	const second = JSON.parse(fs.readFileSync(path.join(dataDir, "chats", `${secondId}.json`), "utf-8"));
 	assert.equal(second.attachments.length, 1);
 	assert.equal(second.attachments[0].file, record.attachments[0].file, "the same book points at the same stored file");
-	assert.equal(fs.readdirSync(path.join(dataDir, "attachments")).length, 2, "3 attachments across 2 sessions, 2 files stored");
-	assert.deepEqual(errors, []);
+	assert.equal(fs.readdirSync(path.join(dataDir, "attachments")).length, 3, "4 attachments across 2 sessions, 3 files stored");
 	console.log("✓ second session: the same book attached again is stored once, shared by both sessions");
 } catch (err) {
 	console.error(logs.slice(-4000));

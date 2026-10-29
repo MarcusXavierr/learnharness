@@ -67,6 +67,9 @@ export interface ChatStore {
 	/** Append attachment records (the files are already on disk). Like
 	 *  saveSettings, not conversation activity: updatedAt stays put. */
 	addAttachments(id: string, attachments: AttachmentRecord[]): void;
+	/** Detach (true) or restore (false) one attachment. Null when the chat has no attachment with that id.
+	 *  Not conversation activity: updatedAt stays put. */
+	setAttachmentDetached(id: string, attachmentId: string, detached: boolean): AttachmentRecord | null;
 	/** Every attachment blob name any chat record references (raw scan —
 	 *  includes records this build refuses to read), for blob sweeps. */
 	referencedAttachmentFiles(): Set<string>;
