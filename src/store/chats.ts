@@ -12,7 +12,7 @@ import * as path from "node:path";
 import { PATHS } from "../../config.ts";
 import { emit } from "../core/events.ts";
 import type { ChatStore } from "../core/ports.ts";
-import type { ChatRecord, ChatSettings, ChatSummary, ExtractionRunUsage, PlanTree, TurnUsage } from "../core/contracts.ts";
+import type { AttachmentRecord, ChatRecord, ChatSettings, ChatSummary, ExtractionRunUsage, PlanTree, TurnUsage } from "../core/contracts.ts";
 import { CURRENT_CHAT_VERSION } from "../core/contracts.ts";
 import type { LhMessage } from "../core/native-messages.ts";
 import { activeProblemOf, danglingQuestionOf } from "../core/native-messages.ts";
@@ -195,6 +195,15 @@ function deleteChat(id: string): boolean {
 	}
 }
 
+/** Append attachment records — the files are already on disk (store/
+ *  attachments.ts). Not conversation activity: updatedAt stays put. */
+function addAttachments(id: string, attachments: AttachmentRecord[]): void {
+	const record = getChat(id);
+	if (!record) throw new Error(`Chat not found: ${id}`);
+	record.attachments = [...(record.attachments ?? []), ...attachments];
+	writeChat(record);
+}
+
 /** Persist the session plan tree (plan tools call this in execute). */
 function saveTree(id: string, tree: PlanTree): void {
 	const record = getChat(id);
@@ -214,6 +223,7 @@ export const chatStore: ChatStore = {
 	saveSettings,
 	renameChat,
 	deleteChat,
+	addAttachments,
 	appendTurnUsage,
 	appendExtractionUsage,
 };

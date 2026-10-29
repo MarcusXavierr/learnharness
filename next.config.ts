@@ -108,6 +108,13 @@ const nextConfig: NextConfig = {
 		"@napi-rs/canvas", // native binding — bundling breaks the .node require
 		"@resvg/resvg-js", // native binding — same
 	],
+	// proxy.ts guards every /api route, and Next buffers proxied bodies up to
+	// this limit (default 10MB) — beyond it the route sees a TRUNCATED body.
+	// Session attachments upload one file per request, capped at
+	// ATTACHMENT_MAX_BYTES (50MB, core/contracts/chat.ts) + multipart slack.
+	experimental: {
+		proxyClientMaxBodySize: "51mb",
+	},
 };
 
 export default nextConfig;

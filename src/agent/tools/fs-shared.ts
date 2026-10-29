@@ -5,8 +5,11 @@ import * as path from "node:path";
 /**
  * Shared plumbing for the learner-filesystem tools (ls / find / grep) —
  * sources v1 (2026-09-19): the agent locates and reads the learner's files
- * itself, so paths need no UI affordance (user decision: no attachments —
- * the learner references files in messages; the agent finds them).
+ * itself, so paths need no UI affordance (user decision, 2026-09: the
+ * learner references files in messages; the agent finds them). Since
+ * 2026-10-29 the learner can ALSO attach files from the composer — those
+ * are copied into the session and read by the scoped tools in
+ * attachments.ts; these tools stay the path for everything else.
  *
  * Safety posture (user-locked): READ-ONLY by construction — no shell-out,
  * no user-controlled process args, no mutation APIs anywhere here. The one
@@ -41,6 +44,15 @@ const EXCLUDED_DIR_NAMES = new Set(["node_modules", ".git", "Library", ".Trash"]
 export function resolveSourcePath(p?: string): string {
 	if (!p) return os.homedir();
 	return path.isAbsolute(p) ? p : path.join(os.homedir(), p);
+}
+
+/** Resolve a tool-supplied path and require it to live INSIDE `dir` —
+ *  the scoped tools' filesystem ends at that wall (null = outside). */
+export function scopedPath(dir: string, filePath: string): string | null {
+	const root = path.resolve(dir) + path.sep;
+	const resolved = path.resolve(dir, filePath);
+	if (!resolved.startsWith(root)) return null;
+	return resolved;
 }
 
 /** pi's formatSize idiom (50KB prints as "50.0KB"). */

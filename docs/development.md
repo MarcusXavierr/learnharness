@@ -23,6 +23,7 @@ npm test             # the full suite (node:test via tsx; deterministic, no LLM,
 npm run lint         # eslint — includes the import law (architecture §2)
 npm run typecheck    # tsc --noEmit
 node scripts/smoke-web-subscriptions.mjs # after build: offline Next start/dev + reload gate
+node scripts/smoke-attachments.mjs       # next dev + headless Chrome (LH_TEST_CHROME): attach → send → stored
 
 npm run desktop:dev    # next dev + Electron shell pointed at it
 npm run desktop:dist   # local signed/notarized macOS arm64 build (LH_NOTARY keychain)

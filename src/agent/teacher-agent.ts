@@ -17,6 +17,12 @@ import {
 import { practiceTools, type PracticeToolContext } from "./tools/practice.ts";
 import { healToolRecord, withArgumentHeal } from "./tools/heal.ts";
 import { sendToUserTool } from "./tools/send-to-user.ts";
+import {
+	attachmentImageParts,
+	attachmentsPromptSection,
+	attachmentTools,
+	type SessionAttachments,
+} from "./tools/attachments.ts";
 import { quizInputObject, quizInputProblems } from "../core/question-core.ts";
 import { QUESTION_TOOLS, type EnabledTools } from "../core/pending.ts";
 import { toLlmMessages, nativeInputCause, PRACTICE_PROBLEM_TOOL } from "../core/native-messages.ts";
@@ -128,6 +134,11 @@ export interface AgentBuildOptions {
 	 *  <chatId>.jsonl via providerEventObserver — the GLM-truncation /
 	 *  DeepSeek-id incident layer. Absent or env-off → no observer. */
 	chatId?: string;
+	/** The session's context attachments (2026-10-29): the system prompt's
+	 *  manifest section, the scoped pdf_* / epub_* readers (joined to every
+	 *  kind's registry unless an explicit `tools` registry is passed), and
+	 *  inline images for vision models. Absent/empty = none of the three. */
+	attachments?: SessionAttachments;
 }
 
 /**
@@ -181,9 +192,15 @@ function baseAgentOptions(kind: AgentKind, opts: AgentBuildOptions, tools: Agent
 	// ("practice" is not a ModelRole) honest about that.
 	const engine = opts.engine ?? piEngineFor(kind as "prober" | "teacher");
 	const stopper = makeQuestionStopper(kind);
-	const systemPrompt = opts.promptSwitches
+	const instructions = opts.promptSwitches
 		? composeInstructions(kind, opts.promptSwitches)
 		: composedInstructions[kind]!;
+	// Appended AFTER the doctrine so the stable prefix stays cacheable; the
+	// section itself only changes when the learner attaches a file.
+	const attachmentSection = attachmentsPromptSection(opts.attachments);
+	const systemPrompt = attachmentSection ? `${instructions}\n\n---\n\n${attachmentSection}` : instructions;
+	const sessionTools = opts.tools === undefined ? Object.values(healToolRecord(attachmentTools(opts.attachments))) : [];
+	const showImages = engine.model.input?.includes("image") ?? false;
 	// Debug recorder (owner, 2026-10-04): raw provider events when
 	// LH_PROVIDER_EVENTS=1 and the caller handed a chatId; undefined is
 	// the normal no-observer path (tests, env-off).
@@ -202,6 +219,7 @@ function baseAgentOptions(kind: AgentKind, opts: AgentBuildOptions, tools: Agent
 			// transport. Explicit test registries remain caller-owned.
 			tools: [
 				...tools,
+				...sessionTools,
 				...(opts.tools === undefined && engine.model.id.toLowerCase().includes("claude")
 					? [withArgumentHeal(sendToUserTool)]
 					: []),
@@ -230,7 +248,10 @@ function baseAgentOptions(kind: AgentKind, opts: AgentBuildOptions, tools: Agent
 		// UI-only markers (plan-block) drop, the app's id fields strip, and
 		// an abort's dangling question call gets its INTERRUPTED result. It
 		// must never throw (pi's convertToLlm contract).
-		convertToLlm: toLlmMessages,
+		// Attached images ride the message they were sent with — vision
+		// models only; for the rest the ids just strip (the manifest names it).
+		convertToLlm: (messages) =>
+			toLlmMessages(messages, showImages ? { attachmentParts: attachmentImageParts(opts.attachments) } : {}),
 		prepareRequest: (request) => {
 			if (opts.callPurpose) {
 				let learner = false, automatic = false;

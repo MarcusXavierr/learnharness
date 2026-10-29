@@ -11,6 +11,7 @@
 
 import type { LhMessage } from "./native-messages.ts";
 import type {
+	AttachmentRecord,
 	ChatRecord,
 	ChatSettings,
 	ChatSummary,
@@ -63,6 +64,9 @@ export interface ChatStore {
 	 *  job cleanup are the caller's choreography (core/graph-deletion.ts +
 	 *  the DELETE route), not the store's. */
 	deleteChat(id: string): boolean;
+	/** Append attachment records (the files are already on disk). Like
+	 *  saveSettings, not conversation activity: updatedAt stays put. */
+	addAttachments(id: string, attachments: AttachmentRecord[]): void;
 }
 
 // ─── GraphStore — the append-only evidence ledgers (data/graph) ──────────────

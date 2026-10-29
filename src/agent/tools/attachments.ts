@@ -1,0 +1,207 @@
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { Type } from "typebox";
+import type { AgentTool } from "@earendil-works/pi-agent-core";
+import type { ImageContent } from "@earendil-works/pi-ai";
+import type { AttachmentRecord } from "../../core/contracts.ts";
+import { serverExecute } from "../tool-execute.ts";
+import { epubChapterMarkdown, epubInfo, epubSearch } from "../subagents/epub-ops.ts";
+import { pdfExtract, pdfInfo, pdfSearch } from "../subagents/pdf-ops.ts";
+import { capOutput, formatSize, scopedPath } from "./fs-shared.ts";
+import { readTextSlice } from "./read.ts";
+
+/**
+ * Session context attachments (2026-10-29) — the agent side. The learner
+ * attaches images, PDFs and EPUBs from the composer; the server copies
+ * them into the chat's attachments dir. Here:
+ *
+ * - attachmentsPromptSection: the system prompt's manifest, rebuilt every
+ *   turn from the record (survives compaction and resume), stable while
+ *   the list is unchanged so prompt caching holds;
+ * - attachmentTools: paged readers scoped to the attachments dir — pdf_*
+ *   (pdf-ops, the researcher's text layer) and epub_* (epub-ops). The
+ *   agent reads slices on demand, Claude Code style; nothing is inlined;
+ * - attachmentImageParts: the wire hook that shows an image to a vision
+ *   model on the message it was sent with (toLlmMessages).
+ *
+ * Tool contract (the web.ts law): expected failures RETURN error strings —
+ * never throw into the agent loop.
+ */
+
+export interface SessionAttachments {
+	/** The chat's attachments directory (absolute). */
+	dir: string;
+	records: AttachmentRecord[];
+}
+
+function describe(a: AttachmentRecord): string {
+	const size = formatSize(a.bytes);
+	if (a.kind === "pdf") return `PDF, ${a.pages ?? "?"} pages, ${size} → pdf_info / pdf_search / pdf_extract; the \`pdf\` job for figures and equations`;
+	if (a.kind === "epub") return `EPUB${a.title ? ` "${a.title}"` : ""}, ${a.chapters ?? "?"} chapters, ${size} → epub_info / epub_search / epub_read`;
+	return `image, ${size} → shown on the message it was sent with; \`read\` to look again`;
+}
+
+export function attachmentsPromptSection(attachments: SessionAttachments | undefined): string {
+	if (!attachments?.records.length) return "";
+	const lines = attachments.records.map((a) => `- ${a.name} — ${describe(a)} — path: ${path.join(attachments.dir, a.file)}`);
+	return [
+		"## Session attachments",
+		"",
+		"The learner attached these files to this session as context. Consult them when the lesson needs their content: " +
+			"start from structure (pdf_info / epub_info), search for the passage you need, then read only those pages or that chapter. " +
+			"Never read a whole book or document in one go. Cite page or chapter when you use them.",
+		"",
+		...lines,
+	].join("\n");
+}
+
+/** Image content for the ids attached to one message (vision models only;
+ *  unreadable files drop silently — the manifest still names them). */
+export function attachmentImageParts(attachments: SessionAttachments | undefined) {
+	return (ids: readonly string[]): ImageContent[] => {
+		if (!attachments) return [];
+		const parts: ImageContent[] = [];
+		for (const id of ids) {
+			const a = attachments.records.find((r) => r.id === id && r.kind === "image");
+			if (!a) continue;
+			try {
+				parts.push({ type: "image", mimeType: a.mimeType, data: fs.readFileSync(path.join(attachments.dir, a.file)).toString("base64") });
+			} catch {
+				// File gone from disk: the image simply isn't shown.
+			}
+		}
+		return parts;
+	};
+}
+
+const pathParam = Type.String({ description: "The attachment's path, exactly as listed under Session attachments" });
+
+function failure(tool: string, err: unknown): string {
+	return `${tool} failed: ${err instanceof Error ? err.message : String(err)}`;
+}
+
+export function attachmentTools(attachments: SessionAttachments | undefined): Record<string, AgentTool<any>> {
+	if (!attachments) return {};
+	const { dir, records } = attachments;
+	const tools: Record<string, AgentTool<any>> = {};
+	const outside = (tool: string) => `${tool} failed: the path must be one of this session's attachments`;
+
+	if (records.some((r) => r.kind === "pdf")) {
+		const infoInput = Type.Object({ path: pathParam });
+		const extractInput = Type.Object({
+			path: pathParam,
+			pages: Type.String({ description: "Pages to extract: '1-5', '1,3,7', or '3'. Use pdf_info / pdf_search first and keep the range narrow." }),
+		});
+		const searchInput = Type.Object({ path: pathParam, query: Type.String({ description: "Text to find (case-insensitive substring)" }) });
+		tools.pdf_info = {
+			name: "pdf_info",
+			label: "pdf_info",
+			description: "Triage an attached PDF: page count plus per-page signals (text_length, image_count, math_density).",
+			parameters: infoInput,
+			execute: serverExecute("pdf_info", infoInput, async ({ path: p }) => {
+				const scoped = scopedPath(dir, p);
+				if (!scoped) return outside("pdf_info");
+				try {
+					const info = await pdfInfo(scoped);
+					return { page_count: info.page_count, mean_text_length: info.mean_text_length, pages: info.pages };
+				} catch (err) {
+					return failure("pdf_info", err);
+				}
+			}),
+		};
+		tools.pdf_extract = {
+			name: "pdf_extract",
+			label: "pdf_extract",
+			description: `Extract the text of specific pages of an attached PDF. Output is capped at ${formatSize(50 * 1024)} — request fewer pages if it truncates.`,
+			parameters: extractInput,
+			execute: serverExecute("pdf_extract", extractInput, async ({ path: p, pages }) => {
+				const scoped = scopedPath(dir, p);
+				if (!scoped) return outside("pdf_extract");
+				try {
+					const { content, truncated } = capOutput((await pdfExtract(scoped, pages)).split("\n"));
+					return truncated ? `${content}\n\n[Output truncated at ${formatSize(50 * 1024)}. Request a narrower page range.]` : content;
+				} catch (err) {
+					return failure("pdf_extract", err);
+				}
+			}),
+		};
+		tools.pdf_search = {
+			name: "pdf_search",
+			label: "pdf_search",
+			description: "Find text in an attached PDF — returns the pages and contexts that hit.",
+			parameters: searchInput,
+			execute: serverExecute("pdf_search", searchInput, async ({ path: p, query }) => {
+				const scoped = scopedPath(dir, p);
+				if (!scoped) return outside("pdf_search");
+				try {
+					return { hits: (await pdfSearch(scoped, query, { literal: true })).hits };
+				} catch (err) {
+					return failure("pdf_search", err);
+				}
+			}),
+		};
+	}
+
+	if (records.some((r) => r.kind === "epub")) {
+		const infoInput = Type.Object({ path: pathParam });
+		const readInput = Type.Object({
+			path: pathParam,
+			chapter: Type.Integer({ minimum: 1, description: "Chapter number from epub_info (reading order, 1-based)" }),
+			offset: Type.Optional(Type.Integer({ minimum: 1, description: "Line number to start reading from (1-indexed)" })),
+			limit: Type.Optional(Type.Integer({ minimum: 1, description: "Maximum number of lines to read" })),
+		});
+		const searchInput = Type.Object({ path: pathParam, query: Type.String({ description: "Text to find (case-insensitive substring)" }) });
+		tools.epub_info = {
+			name: "epub_info",
+			label: "epub_info",
+			description: "The structure of an attached EPUB: title, author, and every chapter (number, title, word count) in reading order.",
+			parameters: infoInput,
+			execute: serverExecute("epub_info", infoInput, async ({ path: p }) => {
+				const scoped = scopedPath(dir, p);
+				if (!scoped) return outside("epub_info");
+				try {
+					return await epubInfo(scoped);
+				} catch (err) {
+					return failure("epub_info", err);
+				}
+			}),
+		};
+		tools.epub_read = {
+			name: "epub_read",
+			label: "epub_read",
+			description:
+				"Read one chapter of an attached EPUB as Markdown. Output is truncated to 2000 lines or 50.0KB (whichever is hit first); " +
+				"use offset/limit to page through a long chapter.",
+			parameters: readInput,
+			execute: serverExecute("epub_read", readInput, async ({ path: p, chapter, offset, limit }) => {
+				const scoped = scopedPath(dir, p);
+				if (!scoped) return outside("epub_read");
+				try {
+					return readTextSlice(await epubChapterMarkdown(scoped, chapter), offset, limit);
+				} catch (err) {
+					return failure("epub_read", err);
+				}
+			}),
+		};
+		tools.epub_search = {
+			name: "epub_search",
+			label: "epub_search",
+			description: "Find text in an attached EPUB — returns matching lines with their chapter number, chapter title and nearest heading.",
+			parameters: searchInput,
+			execute: serverExecute("epub_search", searchInput, async ({ path: p, query }) => {
+				const scoped = scopedPath(dir, p);
+				if (!scoped) return outside("epub_search");
+				try {
+					const hits = await epubSearch(scoped, query);
+					if (hits.length === 0) return "No matches.";
+					const lines = hits.map((h) => `ch ${h.chapter} (${h.chapterTitle}${h.heading ? ` › ${h.heading}` : ""}): ${h.text}`);
+					return capOutput(lines).content;
+				} catch (err) {
+					return failure("epub_search", err);
+				}
+			}),
+		};
+	}
+
+	return tools;
+}

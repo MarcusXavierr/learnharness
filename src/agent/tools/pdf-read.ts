@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { Type } from "typebox";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { serverExecute } from "../tool-execute.ts";
+import { scopedPath } from "./fs-shared.ts";
 import { pdfExtract, pdfInfo, pdfProbe, pdfSearch } from "../subagents/pdf-ops.ts";
 
 /**
@@ -41,15 +42,6 @@ function flaggedPages(info: Awaited<ReturnType<typeof pdfInfo>>): number[] {
 		.filter((p) => p.math_density >= 0.03 || p.image_count > 0)
 		.slice(0, 30)
 		.map((p) => p.page);
-}
-
-/** Resolve a tool-supplied path and require it to live INSIDE the job's
- *  pdf dir — the researcher's filesystem ends at the temp dir's wall. */
-function scopedPath(dir: string, filePath: string): string | null {
-	const root = path.resolve(dir) + path.sep;
-	const resolved = path.resolve(dir, filePath);
-	if (!resolved.startsWith(root)) return null;
-	return resolved;
 }
 
 /** Filename for a downloaded PDF — slug from the URL's last segment plus a

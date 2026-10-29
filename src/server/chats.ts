@@ -4,6 +4,7 @@ import { coverageOf } from "../core/coverage.ts";
 import { deleteChatTraces, type ChatDeleteMode, type ChatDeletionStats } from "../core/graph-deletion.ts";
 import { titleFromPrompt } from "../core/contracts.ts";
 import { graphRevision } from "./graph.ts";
+import { deleteAttachmentsDir } from "../store/attachments.ts";
 import { stores } from "./stores.ts";
 import { isTurnRunning } from "./turn-liveness.ts";
 import { clearTurnFailure } from "./turn-runs.ts";
@@ -129,6 +130,7 @@ export async function deleteChatSession(chatId: string, mode: ChatDeleteMode): P
 	if (stores.chatStore.deleteChat(chatId)) {
 		discardChatDeliveries(chatId);
 		clearTurnFailure(chatId);
+		deleteAttachmentsDir(chatId);
 	}
 	return { ok: true, mode, stats, jobsRemoved, graphRevision: graphRevision() };
 }
