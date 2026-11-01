@@ -7,23 +7,29 @@
  */
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { after, describe, it } from "node:test";
 import { createFauxCore, fauxAssistantMessage, fauxText, fauxToolCall, type FauxResponseStep, type ModelImageResizeOptions, type SystemMessage } from "@earendil-works/pi-ai";
 import { createCanvas } from "@napi-rs/canvas";
 import * as photon from "@silvia-odwyer/photon-node";
-import { createTeacherAgent } from "../src/agent/teacher-agent.ts";
-import { handleChatRequest } from "../src/server/chat-handler.ts";
-import { deleteChatSession } from "../src/server/chats.ts";
-import { runningTurn } from "../src/server/turn-runs.ts";
-import { chatStore } from "../src/store/chats.ts";
-import { attachmentsRoot, removeBlobsUnreferenced } from "../src/store/attachments.ts";
-import { newCompactionMarker } from "../src/core/compaction.ts";
 import type { AttachmentRecord } from "../src/core/contracts.ts";
 import type { PiEngine } from "../src/agent/models.ts";
-import { PATHS } from "../config.ts";
 import { makeEpub } from "./fixtures/make-epub.ts";
 
+// Hermetic: LH_DATA_DIR → a temp dir, set BEFORE the first app-module import
+// (the seam is env-at-module-load), so every app-module import is dynamic.
+const TMP_DATA = fs.mkdtempSync(path.join(os.tmpdir(), "lh-attachments-"));
+process.env.LH_DATA_DIR = TMP_DATA;
+
+const { createTeacherAgent } = await import("../src/agent/teacher-agent.ts");
+const { handleChatRequest } = await import("../src/server/chat-handler.ts");
+const { deleteChatSession } = await import("../src/server/chats.ts");
+const { runningTurn } = await import("../src/server/turn-runs.ts");
+const { chatStore } = await import("../src/store/chats.ts");
+const { attachmentsRoot } = await import("../src/store/attachments.ts");
+const { newCompactionMarker } = await import("../src/core/compaction.ts");
+const { PATHS } = await import("../config.ts");
 const attachmentsRoute = await import("../app/api/chats/[id]/attachments/route.ts");
 const attachmentRoute = await import("../app/api/chats/[id]/attachments/[attachmentId]/route.ts");
 
@@ -74,12 +80,7 @@ function scripted(
 	return { engine, seen };
 }
 
-const createdChats: string[] = [];
-const createdBlobs = new Set<string>();
-after(() => {
-	for (const id of createdChats) fs.rmSync(path.join(PATHS.chats, `${id}.json`), { force: true });
-	removeBlobsUnreferenced(createdBlobs, chatStore.referencedAttachmentFiles());
-});
+after(() => fs.rmSync(TMP_DATA, { recursive: true, force: true }));
 
 /** The blob store's contents (every session's attached files, stored once). */
 function blobs(): string[] {
@@ -93,7 +94,6 @@ function blobs(): string[] {
 function newChat(): string {
 	const chat = chatStore.createChat("Test: attachments");
 	chatStore.saveSettings(chat.id, { model: { provider: "openrouter", id: "z-ai/glm-5.3-flash" } });
-	createdChats.push(chat.id);
 	return chat.id;
 }
 
@@ -110,7 +110,6 @@ async function upload(chatId: string, name: string, bytes: Uint8Array) {
 async function attach(chatId: string, name: string, bytes: Uint8Array): Promise<{ record: AttachmentRecord; path: string }> {
 	const result = await upload(chatId, name, bytes);
 	assert.ok(result.ok, result.error);
-	createdBlobs.add(result.attachment!.file);
 	return { record: result.attachment!, path: path.join(attachmentsRoot(), result.attachment!.file) };
 }
 
