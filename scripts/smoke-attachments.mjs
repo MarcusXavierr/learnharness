@@ -113,9 +113,9 @@ try {
 		assert.deepEqual(chipText, names);
 
 		await page.evaluate(value => {
-			const textarea = document.querySelector('[data-testid="composer"] textarea');
-			Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value").set.call(textarea, value);
-			textarea.dispatchEvent(new Event("input", { bubbles: true }));
+			const input = document.querySelector('[data-testid="composer"] [data-file-path-input]') || document.querySelector("[data-file-path-input]");
+			input.textContent = value;
+			input.dispatchEvent(new Event("input", { bubbles: true }));
 		}, text);
 		await page.waitForFunction(() => {
 			const button = document.querySelector('button[aria-label="Start session"], [data-testid="composer"] button[aria-label="Send"]');
