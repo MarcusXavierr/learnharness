@@ -5,8 +5,11 @@ import * as path from "node:path";
 /**
  * Shared plumbing for the learner-filesystem tools (ls / find / grep) —
  * sources v1 (2026-09-19): the agent locates and reads the learner's files
- * itself, so paths need no UI affordance (user decision: no attachments —
- * the learner references files in messages; the agent finds them).
+ * itself, so paths need no UI affordance (user decision, 2026-09: the
+ * learner references files in messages; the agent finds them). Since
+ * 2026-10-29 the learner can ALSO attach files from the composer — those
+ * are stored once by content and read by the record-scoped tools in
+ * attachments.ts; these tools stay the path for everything else.
  *
  * Safety posture (user-locked): READ-ONLY by construction — no shell-out,
  * no user-controlled process args, no mutation APIs anywhere here. The one
@@ -37,9 +40,12 @@ const EXCLUDED_DIR_NAMES = new Set(["node_modules", ".git", "Library", ".Trash"]
 
 /** Resolve a tool path argument: absolute stays, relative/absent → home.
  *  (pi resolves against the project cwd; the harness's "project" is the
- *  learner's life, so the home directory is the anchor.) */
+ *  learner's life, so the home directory is the anchor.) A leading `~` or
+ *  `~/` is the home directory, as a shell would expand it — learners and
+ *  models write paths that way. `~user` is not expanded. */
 export function resolveSourcePath(p?: string): string {
 	if (!p) return os.homedir();
+	if (p === "~" || p.startsWith("~/") || p.startsWith(`~${path.sep}`)) return path.join(os.homedir(), p.slice(1));
 	return path.isAbsolute(p) ? p : path.join(os.homedir(), p);
 }
 

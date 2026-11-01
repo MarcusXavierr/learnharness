@@ -11,6 +11,7 @@
 
 import type { LhMessage } from "./native-messages.ts";
 import type {
+	AttachmentRecord,
 	ChatRecord,
 	ChatSettings,
 	ChatSummary,
@@ -63,6 +64,15 @@ export interface ChatStore {
 	 *  job cleanup are the caller's choreography (core/graph-deletion.ts +
 	 *  the DELETE route), not the store's. */
 	deleteChat(id: string): boolean;
+	/** Append attachment records (the files are already on disk). Like
+	 *  saveSettings, not conversation activity: updatedAt stays put. */
+	addAttachments(id: string, attachments: AttachmentRecord[]): void;
+	/** Detach (true) or restore (false) one attachment. Null when the chat has no attachment with that id.
+	 *  Not conversation activity: updatedAt stays put. */
+	setAttachmentDetached(id: string, attachmentId: string, detached: boolean): AttachmentRecord | null;
+	/** Every attachment blob name any chat record references (raw scan —
+	 *  includes records this build refuses to read), for blob sweeps. */
+	referencedAttachmentFiles(): Set<string>;
 }
 
 // ─── GraphStore — the append-only evidence ledgers (data/graph) ──────────────
@@ -101,6 +111,8 @@ export interface GraphStore {
 	upsertSource(source: NotesSource): void;
 	/** Every notes source record, by id order-insensitive. */
 	readSources(): NotesSource[];
+	/** Remove imported-source bookkeeping only; the service removes graph traces first. */
+	deleteSources(ids: ReadonlySet<string>): number;
 	/** Append one run's usage to a source record — idempotent per
 	 *  startedAt, mirroring ChatRecord.extractions. */
 	appendSourceUsage(id: string, entry: ExtractionRunUsage): void;
@@ -126,6 +138,12 @@ export interface GraphStore {
 		coverage?: CoverageEntry[];
 		checkpoints?: SessionCheckpoint[];
 	}): void;
+}
+
+/** Separate from graph ledgers and source identity, for future shared views. */
+export interface SourceOrganizationStore {
+	read(): import("./source-organization.ts").SourceOrganization;
+	write(state: import("./source-organization.ts").SourceOrganization): void;
 }
 
 // ─── JobStore — background sub-agent jobs (data/jobs) ─────────────────────────

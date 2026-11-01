@@ -39,17 +39,23 @@ import {
 	newProblemDismissedMarker,
 	newThinkingMessage,
 	newUserMessage,
+	newMessageId,
+	questionCallsOf,
 	pendingProblemDismissalOf,
 } from "./native-messages.ts";
 import { QUESTION_TOOLS, toolQuestionKind } from "./pending.ts";
 
 /** One client-originated input event (the POST body's `input`). */
 export type ChatInput =
-	| { type: "text"; text: string }
+	/** attachmentIds: session attachments sent with this message (uploaded
+	 *  first via /api/chats/[id]/attachments; validated against the record). */
+	| { type: "text"; text: string; attachmentIds?: string[] }
 	| { type: "answer"; toolCallId: string; answer: QuestionAnswerData }
 	| { type: "continue" }
 	/** The failed-turn retry (issue #110): the banner's Retry button. */
 	| { type: "retry" }
+	/** Explicit replacement of the current malformed question batch. */
+	| { type: "retry-question"; messageId: string; contentIndex: number; toolCallId: string }
 	/** The practice dock's two buttons (owner, 2026-10-04): the learner's
 	 *  thinking on the ACTIVE problem — one lane (owner 2026-10-05):
 	 *  whether it claims an answer is read from the text. One
@@ -164,7 +170,10 @@ export function parseChatInput(input: unknown): ChatInput {
 			if (typeof i.text !== "string" || (i.text as string).trim().length === 0) {
 				throw new ChatInputError("text input requires non-empty text");
 			}
-			return { type: "text", text: i.text };
+			if (i.attachmentIds !== undefined && (!Array.isArray(i.attachmentIds) || !i.attachmentIds.every((a) => typeof a === "string"))) {
+				throw new ChatInputError("text input's attachmentIds must be a list of attachment ids");
+			}
+			return { type: "text", text: i.text, ...((i.attachmentIds as string[] | undefined)?.length ? { attachmentIds: i.attachmentIds as string[] } : {}) };
 		case "answer":
 			if (typeof i.toolCallId !== "string" || i.toolCallId.length === 0) {
 				throw new ChatInputError("answer input requires toolCallId");
@@ -177,6 +186,12 @@ export function parseChatInput(input: unknown): ChatInput {
 			return { type: "continue" };
 		case "retry":
 			return { type: "retry" };
+		case "retry-question":
+			if (typeof i.messageId !== "string" || !i.messageId || typeof i.toolCallId !== "string" || !i.toolCallId ||
+				typeof i.contentIndex !== "number" || !Number.isSafeInteger(i.contentIndex) || i.contentIndex < 0) {
+				throw new ChatInputError("retry-question input requires an exact question occurrence");
+			}
+			return { type: "retry-question", messageId: i.messageId, contentIndex: i.contentIndex, toolCallId: i.toolCallId };
 		case "thinking":
 			if (typeof i.problemCallId !== "string" || i.problemCallId.length === 0) {
 				throw new ChatInputError("thinking input requires problemCallId");
@@ -202,12 +217,15 @@ export function parseChatInput(input: unknown): ChatInput {
  * double-answering.
  */
 export function inputAppends(
-	record: { messages: LhMessage[]; kind?: string },
+	record: { messages: LhMessage[]; kind?: string; attachments?: readonly { id: string }[] },
 	input: ChatInput,
 ): LhMessage[] {
 	switch (input.type) {
-		case "text":
-			return [...dismissalConclusion(record), newUserMessage(input.text)];
+		case "text": {
+			const unknown = input.attachmentIds?.filter((id) => !record.attachments?.some((a) => a.id === id)) ?? [];
+			if (unknown.length > 0) throw new ChatInputError(`text input names unknown attachments: ${unknown.join(", ")}`);
+			return [...dismissalConclusion(record), newUserMessage(input.text, input.attachmentIds)];
+		}
 		case "answer": {
 			const pending = danglingQuestionOf(record.messages);
 			if (!pending || pending.toolCallId !== input.toolCallId) {
@@ -221,6 +239,8 @@ export function inputAppends(
 			// The input already landed write-ahead. retryDrops affects only
 			// the temporary agent history — nothing new appends here.
 			return [];
+		case "retry-question":
+			return questionRecoveryAppends(record.messages, input);
 		case "thinking": {
 			const active = activeProblemOf(record.messages);
 			if (!active || active.toolCallId !== input.problemCallId) {
@@ -242,6 +262,24 @@ export function inputAppends(
 			return [...dismissalConclusion(record), newNextMessage()];
 		}
 	}
+}
+
+/** Validate before any turn effects, then again against current saved truth.
+ * Never accepts a failed/aborted generation (the existing Retry/new-message
+ * paths own those), a stale occurrence, or an answerable sibling. */
+export function questionRecoveryAppends(
+	messages: readonly LhMessage[],
+	input: Extract<ChatInput, { type: "retry-question" }>,
+): LhMessage[] {
+	const calls = questionCallsOf(messages);
+	const target = calls.find(call => call.messageId === input.messageId && call.contentIndex === input.contentIndex && call.toolCallId === input.toolCallId);
+	if (!target || target.status !== "malformed") throw new ChatInputError("This malformed question is no longer available to retry. Refresh the session.");
+	if (calls.some(call => call.status === "answerable")) throw new ChatInputError("Answer or discard the remaining question before retrying this one.");
+	return calls.filter(call => call.status === "malformed").map(call => ({
+		id: newMessageId(), role: "toolResult", toolCallId: call.toolCallId, toolName: call.tool,
+		content: [{ type: "text", text: `Tool call "${call.tool}" could not be displayed as a complete question. The learner requested a replacement, not an answer. Re-issue the question with complete, valid arguments.` }],
+		details: { questionRecovery: true }, isError: true, timestamp: Date.now(),
+	}));
 }
 
 /** The failure owning the ephemeral banner. Plan presentation and

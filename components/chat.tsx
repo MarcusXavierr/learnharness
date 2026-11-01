@@ -14,15 +14,17 @@ import {
 	ConversationScrollButton,
 } from "@/components/ai-elements/conversation";
 import { Message, MessageContent, MessageResponse } from "@/components/ai-elements/message";
+import { PathText } from "@/components/file-path-chip";
 import { Reasoning, ReasoningContent, ReasoningTrigger } from "@/components/ai-elements/reasoning";
 import { Shimmer } from "@/components/ai-elements/shimmer";
 import { BrailleSpinner } from "@/components/braille-spinner";
 import { LiveToolCard } from "@/components/artifacts/live-tool-card";
 import { Separator } from "@/components/ui/separator";
 import { AnsweredCard } from "@/components/answered-card";
+import { MalformedQuestion } from "@/components/malformed-question";
 import { artifactRenderers } from "@/components/artifacts";
 import { SubagentSteerCard } from "@/components/artifacts/steer-card";
-import { Composer } from "@/components/composer";
+import { ChatSessionComposer } from "@/components/composer";
 import { useEnterSubmits } from "@/components/enter-submits";
 import { blurAfterPointerClick } from "@/components/focus-hygiene";
 import { dockStateKey } from "@/components/dock-state-key";
@@ -37,6 +39,7 @@ import { useServerEvent, useServerResync } from "@/components/server-events";
 import {
 	isProviderKeyRefusal,
 	firstSourceTextParts,
+	cliContextWindowOf,
 	messageAnchorId,
 	textPartMessageId,
 	kbdEventForAction as kbdEventForChat,
@@ -58,7 +61,9 @@ import { PracticeDock } from "@/components/practice-dock";
 import { ThinkingCard, type PracticeThinkingData } from "@/components/practice-cards";
 import { GraphContextCard, type GraphContextData } from "@/components/graph-context-card";
 import { TopBar } from "@/components/top-bar";
-import type { ArtifactPartProps, JobRecord, Phase3, QuestionAnswerData, QuestionFormDraft, TurnUsage, SessionPricing } from "@/src/core";
+import type { ArtifactPartProps, AttachmentRecord, JobRecord, Phase3, QuestionAnswerData, QuestionFormDraft, TurnUsage, SessionPricing } from "@/src/core";
+import { AttachmentChips, ContextAttachControl, mergeAttachments, SessionFilesControl, useAttachmentDraft } from "@/components/attachments";
+import { ComposerActions } from "@/components/composer-actions";
 import type { LhViewMessage } from "@/src/core";
 import { PhaseChip, PhaseDivider } from "@/components/phase-divider";
 import {
@@ -70,6 +75,8 @@ import { CoverageRing } from "@/components/extraction-coverage";
 import { Button } from "@/components/ui/button";
 import {
 	activeProblemOf,
+	pendingQuestionOf,
+	malformedQuestionsOf,
 	dismissedAnswer,
 	endsInFailedTurn,
 	findPendingToolCall,
@@ -217,6 +224,7 @@ export function Chat({
 	initiallyCompacting = false,
 	initialConfigured = false,
 	kind = "teach",
+	initialAttachments = [],
 }: {
 	chatId: string;
 	title: string;
@@ -240,7 +248,24 @@ export function Chat({
 	 *  it (BYOK, owner 2026-09-22). The server gate stays the truth; this
 	 *  only decides whether the pill rides the composer. */
 	initialConfigured?: boolean;
+	/** The session's context attachments (2026-10-29) — names for the
+	 *  transcript's chips; grows as the composer uploads more. */
+	initialAttachments?: AttachmentRecord[];
 }) {
+	// Session context attachments: the record's list + the composer's draft.
+	const [sessionAttachments, setSessionAttachments] = useState(initialAttachments);
+	const attachmentDraft = useAttachmentDraft((records) => setSessionAttachments((prev) => mergeAttachments(prev, records)));
+	const attachmentItem = (id: string) => {
+		const a = sessionAttachments.find((r) => r.id === id);
+		return { id, name: a?.name ?? "attachment", detached: !!a?.detachedAt };
+	};
+	// The top bar's session-files panel; a transcript chip opens it on its file.
+	const [filesOpen, setFilesOpen] = useState(false);
+	const [filesHighlight, setFilesHighlight] = useState<string | null>(null);
+	const onFilesOpenChange = (open: boolean) => {
+		setFilesOpen(open);
+		if (!open) setFilesHighlight(null);
+	};
 	// Reattach plumbing (background-turn runner wave): the hook holds the
 	// settled terminal's callback — a stable ref assigned below, once
 	// syncFromServer exists (refs, not closures: no stale capture).
@@ -413,6 +438,7 @@ export function Chat({
 				void dismissQuestion(
 					p.toolCallId,
 					reading ? { ...answer, readingThinking: reading } : answer,
+					p.key,
 				);
 				if (busyRef.current) abortInFlightTurn();
 				return;
@@ -444,7 +470,8 @@ export function Chat({
 		// mount-only by design (turnInFlight read at initial value)
 	}, []);
 
-	const pending = findPendingToolCall(messages);
+	const pending = findPendingToolCall(messages, pendingQuestionOf(nativeMessages));
+	const malformedQuestions = malformedQuestionsOf(nativeMessages);
 	// The abort handler reads the pending question from a ref (the window
 	// listener is mount-scoped; the value it needs is render-scoped).
 	const pendingRef = useRef(pending);
@@ -514,7 +541,7 @@ export function Chat({
 	 * thinking while reading the teaching prose, mounted while a check waits
 	 * behind its reveal, riding the check answer (or its dismissal) as the
 	 * separate `readingThinking` field. Reset per pending question. */
-	const [readingThinking, setReadingThinking] = useState("");
+	const [readingThinkingSeed, setReadingThinkingSeed] = useState({ questionId: null as string | null, value: "", revision: 0 });
 	const readingThinkingRef = useRef("");
 
 	// ⌘T (toggle-user-thinking, owner round 2026-10-07): set EVERY user
@@ -527,19 +554,22 @@ export function Chat({
 	}, []);
 	const applyReadingThinking = useCallback((v: string) => {
 		readingThinkingRef.current = v;
-		setReadingThinking(v);
 	}, []);
 	const clearReadingThinking = useCallback(() => {
 		readingThinkingRef.current = "";
-		setReadingThinking("");
+		setReadingThinkingSeed((previous) => ({ ...previous, value: "", revision: previous.revision + 1 }));
 	}, []);
-	const pendingQuestionId = pending?.toolCallId ?? null;
-	useEffect(() => {
+	const pendingQuestionId = pending?.key ?? null;
+	useLayoutEffect(() => {
 		// Different calls never share a draft; a failed submission of THIS
 		// call restores the reading channel alongside the form's snapshot.
-		const reading = pendingQuestionId ? questionDraft(pendingQuestionId)?.readingThinking ?? "" : "";
-		readingThinkingRef.current = reading;
-		setReadingThinking(reading);
+		const value = pendingQuestionId ? questionDraft(pendingQuestionId)?.readingThinking ?? "" : "";
+		readingThinkingRef.current = value;
+		setReadingThinkingSeed((previous) =>
+			previous.questionId === pendingQuestionId && previous.value === value
+				? previous
+				: { questionId: pendingQuestionId, value, revision: previous.revision + 1 },
+		);
 	}, [pendingQuestionId, questionDraft]);
 
 	// The phase at every message (one linear fold): the transcript draws a
@@ -547,15 +577,17 @@ export function Chat({
 	// session's current phase.
 	const phases = useMemo(() => phaseTimeline(messages), [messages]);
 
-	const [text, setText] = useState("");
-	/* The composer's value MIRROR ("nothing gets lost" round, owner
-	 * 2026-10-01): a dictation flush lands via setState, which a closure
-	 * waiting through `await finish()` cannot observe in time. Kept
-	 * current at every write site via applyText. */
+	const [composerDraftRevision, setComposerDraftRevision] = useState(0);
+	/* The composer draft ref is synchronous, so sends and dictation flushes
+	 * read the latest text without a parent render per input event. Explicit
+	 * resets still bump a revision so the local field can sync. */
 	const textRef = useRef("");
 	const applyText = useCallback((v: string) => {
 		textRef.current = v;
-		setText(v);
+		setComposerDraftRevision((revision) => revision + 1);
+	}, []);
+	const recordComposerText = useCallback((v: string) => {
+		textRef.current = v;
 	}, []);
 	// Saved slot completeness is live, but the session's selected route
 	// comes from its own ordinary model control, never today's Strong pin.
@@ -578,11 +610,14 @@ export function Chat({
 		return () => { openingMountedRef.current = false; };
 	}, []);
 
-	const deliverOpeningPrompt = useCallback((prompt: string) => {
+	/** The opening's attachments (uploaded on the new-session page; ids only). */
+	const openingAttachmentIdsRef = useRef<string[]>([]);
+	const deliverOpeningPrompt = useCallback((prompt: string, attachmentIds: string[] = openingAttachmentIdsRef.current) => {
 		openingDraftRef.current = prompt;
+		openingAttachmentIdsRef.current = attachmentIds;
 		// Persist uncertainty BEFORE the POST: another mount must restore,
 		// not race the still-arriving request. No storage means no auto-send.
-		if (!stashOpeningPrompt(chatId, prompt, true)) {
+		if (!stashOpeningPrompt(chatId, prompt, true, attachmentIds)) {
 			applyText(prompt);
 			setOpeningError(true);
 			return;
@@ -590,7 +625,7 @@ export function Chat({
 		setOpeningError(false);
 		draftRef.current = prompt; // The existing 503 flow must restore it too.
 		applyText("");
-		void send({ type: "text", text: prompt }, () => {
+		void send({ type: "text", text: prompt, ...(attachmentIds.length ? { attachmentIds } : {}) }, () => {
 			clearOpeningPrompt(chatId);
 			openingDraftRef.current = null;
 			if (draftRef.current === prompt) draftRef.current = null;
@@ -612,6 +647,7 @@ export function Chat({
 			return;
 		}
 		openingDraftRef.current = prompt!;
+		openingAttachmentIdsRef.current = entry?.attachmentIds ?? [];
 		if (entry?.attempted || initiallyInFlight) {
 			applyText(prompt!); // Interrupted start: the learner explicitly resends.
 			return;
@@ -687,10 +723,10 @@ export function Chat({
 	const cycleChatFields = useCallback((): readonly HTMLElement[] => {
 		const pick = (sel: string) => Array.from(document.querySelectorAll<HTMLElement>(sel));
 		return [
-			...pick('[data-testid="reading-thinking-field"] textarea'),
-			...pick('[data-testid="question-dock"] textarea'),
-			...pick('[data-testid="practice-dock"] textarea'),
-			...pick('[data-testid="composer"] textarea'),
+			...pick('[data-testid="reading-thinking-field"] [data-file-path-input]'),
+			...pick('[data-testid="question-dock"] [data-file-path-input]'),
+			...pick('[data-testid="practice-dock"] [data-file-path-input]'),
+			...pick('[data-testid="composer"] [data-file-path-input]'),
 		];
 	}, []);
 	useFieldCycle(cycleChatFields);
@@ -705,7 +741,7 @@ export function Chat({
 	 * composer: with a question pending the Composer is unmounted, the ref
 	 * is null, and the thinking field is left alone by design. */
 	const dictationWasActiveRef = useRef(false);
-	const composerInputRef = useRef<HTMLTextAreaElement>(null);
+	const composerInputRef = useRef<HTMLDivElement>(null);
 	useEffect(() => {
 		if (dictation.active) {
 			dictationWasActiveRef.current = true;
@@ -734,14 +770,14 @@ export function Chat({
 	// server's registry mutex is the structural gate; this is the
 	// affordance).
 	const [compacting, setCompacting] = useState(initiallyCompacting);
+	const [uploading, setUploading] = useState(false);
 	// A failed model response (issue #110): Retry keeps the saved input
 	// and completed work, without another learner message. Offered from
 	// "error" too: a dropped stream leaves the model there, and send()
 	// recovers from it. Later compaction requires new input instead.
 	const retryable = (status === "ready" || status === "error") && !busy && !compacting && endsInFailedTurn(nativeMessages);
 	const retryFailedTurn = () => retryFailedResponse(send, draftRef);
-	const canSend =
-		(text.trim().length > 0 || dictation.active) && !pending && !activeProblem && !compacting;
+	const sendAllowed = !pending && !activeProblem && !compacting;
 
 	/* THE PRACTICE PAUSE (owner round 16): between problems — practice
 	 * kind, nothing active, nothing in flight, and at least one problem
@@ -1201,7 +1237,7 @@ export function Chat({
 		void dictation.finish().then(doSteerOrSend);
 	};
 	const doSend = () => {
-		if (busy || pending || compacting) return;
+		if (busy || pending || compacting || uploading) return;
 		const t = textRef.current.trim();
 		if (!t) return;
 		if (zeroKeys) {
@@ -1212,13 +1248,30 @@ export function Chat({
 			openModelPicker();
 			return; // No optimistic send and no change to the learner's draft.
 		}
+		// Context attachments upload first (one request per file); the text
+		// stays in the composer until they're on the server.
+		if (attachmentDraft.files.length === 0) {
+			sendText(t, []);
+			return;
+		}
+		setUploading(true);
+		attachmentDraft.upload(chatId).then(
+			(ids) => {
+				setUploading(false);
+				attachmentDraft.clear();
+				sendText(t, ids);
+			},
+			() => setUploading(false), // the control shows the reason; nothing sent
+		);
+	};
+	const sendText = (t: string, attachmentIds: string[]) => {
 		if (openingDraftRef.current !== null) {
-			deliverOpeningPrompt(t);
+			deliverOpeningPrompt(t, [...openingAttachmentIdsRef.current, ...attachmentIds]);
 			return;
 		}
 		draftRef.current = t; // the refusal flow's preserve-and-replay seam
 		applyText("");
-		void send({ type: "text", text: t });
+		void send({ type: "text", text: t, ...(attachmentIds.length ? { attachmentIds } : {}) });
 	};
 
 	/* STEER VS SEND (owner arc 2026-10-03): a send while a turn runs steers
@@ -1235,6 +1288,8 @@ export function Chat({
 		const t = textRef.current.trim();
 		if (!t) return;
 		if (busy) {
+			// A steer carries text only: picked files wait for the turn to end.
+			if (attachmentDraft.files.length > 0) return;
 			applyText("");
 			void steer(t);
 			return;
@@ -1342,6 +1397,16 @@ export function Chat({
 							<div className="min-w-4 flex-1" aria-hidden="true" />
 					</>
 					)}
+					{/* Session files (2026-10-29): every kind — the add path while a
+					    question or probe card blocks the composer. */}
+					<SessionFilesControl
+						chatId={chatId}
+						attachments={sessionAttachments}
+						setAttachments={setSessionAttachments}
+						open={filesOpen}
+						onOpenChange={onFilesOpenChange}
+						highlightId={filesHighlight}
+					/>
 					{/* The plan chip (owner, plan-placement round): session-level
 					    structure beside the phase chip — access to the full-DAG popup
 					    at every width; the marginalia is the wide-screen glance view. */}
@@ -1507,8 +1572,17 @@ export function Chat({
 												    rail as the thinking rows — one quote geometry. */}
 												<div className="font-medium uppercase tracking-wide text-muted-foreground">You</div>
 												<div className="lh-prose whitespace-pre-wrap text-foreground">
-													{m.parts.filter((p) => p.type === "text").map((p) => p.text).join("\n")}
+													<PathText text={m.parts.filter((p) => p.type === "text").map((p) => p.text).join("\n")} />
 												</div>
+												<AttachmentChips
+													items={m.parts
+														.filter((p) => p.type === "data-attachments")
+														.flatMap((p) => (p.data as { ids: string[] }).ids.map(attachmentItem))}
+													onOpen={(id) => {
+														setFilesHighlight(id);
+														setFilesOpen(true);
+													}}
+												/>
 											</div>
 									) : (
 									<Message from="assistant" className="max-w-full">
@@ -1578,6 +1652,13 @@ export function Chat({
 													case "tool-ask_user_question":
 													case "tool-explain":
 													case "tool-recall": {
+														const malformed = !busy && malformedQuestions.find(call => call.messageId === part.sourceMessageId && call.contentIndex === part.sourceContentIndex && call.toolCallId === part.toolCallId);
+														if (malformed) return <MalformedQuestion key={pi} disabled={!!pending || compacting}
+															reason={pending ? "Answer or discard the remaining question first." : undefined}
+															onRetry={() => {
+																draftRef.current = null;
+																void send({ type: "retry-question", messageId: malformed.messageId, contentIndex: malformed.contentIndex, toolCallId: malformed.toolCallId });
+															}} />;
 														// Pending/streaming questions live in the dock, not the
 														// transcript; answered ones render as graded records.
 														if (part.state === "output-available") {
@@ -1675,8 +1756,8 @@ export function Chat({
 				    fold) and NEVER overlaps the composer. */}
 				<DockOverlay
 					pending={pending}
-					initialQuestionDraft={pending ? questionDraft(pending.toolCallId)?.form : undefined}
-					onSaveQuestionDraft={(form) => { if (pending) saveQuestionDraft(pending.toolCallId, { form }); }}
+					initialQuestionDraft={pending ? questionDraft(pending.key)?.form : undefined}
+					onSaveQuestionDraft={(form) => { if (pending) saveQuestionDraft(pending.key, { form }); }}
 					practice={activeProblem}
 					compactionRunning={compacting}
 					onSubmitThinking={submitThinking}
@@ -1685,11 +1766,13 @@ export function Chat({
 					plan={hasPlan ? <PlanMarginalia messages={messages} /> : undefined}
 					onOpenPlan={() => setPlanOpen(true)}
 					requiresReveal={requiresReveal}
-					readingThinking={readingThinking}
+					readingThinking={readingThinkingSeed.value}
+					readingThinkingRevision={readingThinkingSeed.revision}
 					onReadingThinking={applyReadingThinking}
 					phase={phases.at(-1) ?? "probe"}
 					turns={turns}
 					contextTokens={contextTokens}
+					cliContextWindow={cliContextWindowOf(nativeMessages)}
 					pricing={pricing}
 					onReserve={setDockReserve}
 					dictationSlot={<DictationBar dictation={dictation} />}
@@ -1713,19 +1796,24 @@ export function Chat({
 							)
 						)
 					}
+					composerActions={
+						<ComposerActions picker={<ContextAttachControl draft={attachmentDraft} disabled={busy || uploading} lockRemoval={uploading} />} />
+					}
 					composer={
-						<Composer
+						<ChatSessionComposer
 							// Stop aborts ANY in-flight turn (stream-reattach wave): the
 							// square renders while a reattached/wake turn runs too — the
 							// abort channel kills it server-side; stop() alone would
 							// only detach our view.
 							busy={busy}
-							value={text}
-							onChange={applyText}
+							value={textRef.current}
+							revision={composerDraftRevision}
+							onChange={recordComposerText}
 							inputRef={composerInputRef}
 							onSend={onSend}
 							onStop={abortInFlightTurn}
-							canSend={canSend}
+							sendAllowed={sendAllowed}
+							dictationActive={dictation.active}
 							onEscape={dictation.active ? dictation.cancel : undefined}
 							// The pause affordance (owner round 16): the placeholder
 							// IS the hint — empty state, exactly where Enter-on-empty
@@ -1745,11 +1833,11 @@ export function Chat({
 						// ride the same callback (QuestionAnswerData.dismissed). The
 						// reading-thinking draft rides along (owner 2026-10-03) — the
 						// check answer is its only carrier.
-						saveQuestionDraft(pending.toolCallId, { readingThinking: readingThinkingRef.current });
+						saveQuestionDraft(pending.key, { readingThinking: readingThinkingRef.current });
 						const reading = readingThinkingRef.current.trim() || undefined;
 						// The pending-id effect clears this only when the question
 						// actually leaves. An offline preflight keeps the draft visible.
-						submitAnswer(pending.tool, pending.toolCallId, reading ? { ...output, readingThinking: reading } : output);
+						submitAnswer(pending.tool, pending.toolCallId, reading ? { ...output, readingThinking: reading } : output, pending.key);
 					}}
 				/>
 				</Conversation>
@@ -1912,10 +2000,12 @@ function DockOverlay({
 	onSubmitThinking,
 	requiresReveal,
 	readingThinking,
+	readingThinkingRevision,
 	onReadingThinking,
 	phase,
 	turns,
 	contextTokens,
+	cliContextWindow,
 	pricing,
 	composer,
 	onSubmitAnswer,
@@ -1927,9 +2017,10 @@ function DockOverlay({
 	dictationSlot,
 	dictationCancel,
 	setupCta,
+	composerActions,
 	queuedSteers,
 }: {
-	pending: ReturnType<typeof findPendingToolCall>;
+	pending: ReturnType<typeof pendingQuestionOf>;
 	initialQuestionDraft?: QuestionFormDraft;
 	onSaveQuestionDraft: (draft: QuestionFormDraft) => void;
 	/** Compaction running for this chat (round 14) — the docks' submit
@@ -1946,12 +2037,14 @@ function DockOverlay({
 	/** The reading-thinking draft (owner 2026-10-03) — owned by ChatView so
 	 *  the submit + dismissal seams (outside this overlay) can merge it. */
 	readingThinking: string;
+	readingThinkingRevision: number;
 	onReadingThinking: (v: string) => void;
 	/** Session phase at the pending question — scales the thinking field. */
 	phase: Phase3;
 	/** The session's usage log — the stats bar beneath the composer folds it. */
 	turns: TurnUsage[];
 	contextTokens: number | null;
+	cliContextWindow: ReturnType<typeof cliContextWindowOf>;
 	pricing?: SessionPricing;
 	composer: React.ReactNode;
 	onSubmitAnswer: (output: QuestionAnswerData) => void;
@@ -1978,6 +2071,9 @@ function DockOverlay({
 	/** The persistent setup CTA (BYOK, owner 2026-09-22): the same pill
 	 *  home and /chat/new carry, above the composer while slots are unset. */
 	setupCta?: React.ReactNode;
+	/** The composer's action row (session context attachments, 2026-10-29):
+	 *  shown only while the composer itself is (no question, no problem). */
+	composerActions?: React.ReactNode;
 }) {
 	const { isAtBottom, scrollToBottom, scrollRef } = useStickToBottomContext();
 	// Render-fresh bottom state (flicker round): the arrival block below reads
@@ -1995,7 +2091,7 @@ function DockOverlay({
 	const [revealed, setRevealed] = useState(false);
 	const revealPending = requiresReveal && !revealed;
 
-	const pendingId = pending?.toolCallId ?? null;
+	const pendingId = pending?.key ?? null;
 	const initialPendingRef = useRef(pendingId);
 
 	// Teach-question ARRIVAL state, applied during render — BEFORE the
@@ -2058,7 +2154,7 @@ function DockOverlay({
 	const shellRef = useRef<HTMLDivElement>(null);
 	const contentRef = useRef<HTMLDivElement>(null);
 	const mode = pending
-		? `question:${pending.toolCallId}`
+		? `question:${pending.key}`
 		: practice
 			? `practice:${practice.toolCallId}`
 			: "chat";
@@ -2331,6 +2427,7 @@ function DockOverlay({
 					<div ref={viewportRef} data-dock-viewport="" className="pointer-events-auto">
 					<div ref={bodyRef}>
 					{setupCta}
+					{!pending && !practice && composerActions}
 					{/* The queued-steer indicator (owner spec 2026-10-03): quiet
 					    one-liners above the shell - right-aligned to where its corner
 					    rounding starts, truncated, no background, no container. A
@@ -2343,6 +2440,7 @@ function DockOverlay({
 					{pending && requiresReveal && (
 						<ReadingThinkingField
 							value={readingThinking}
+							revision={readingThinkingRevision}
 							onChange={onReadingThinking}
 							onEscape={dictationCancel}
 							onOpen={
@@ -2407,6 +2505,7 @@ function DockOverlay({
 					<StatsBar
 						turns={turns}
 						contextTokens={contextTokens}
+						cliContextWindow={cliContextWindow}
 						pricing={pricing}
 						dictationSlot={dictationSlot}
 						chatId={chatId}
