@@ -1,14 +1,15 @@
-import * as fs from "node:fs";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Type } from "typebox";
-import type { AgentTool } from "@earendil-works/pi-agent-core";
-import type { ImageContent } from "@earendil-works/pi-ai";
+import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
+import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import type { AttachmentRecord } from "../../core/contracts.ts";
 import { serverExecute } from "../tool-execute.ts";
 import { epubChapterMarkdown, epubInfo, epubSearch } from "../subagents/epub-ops.ts";
 import { pdfExtract, pdfInfo, pdfSearch } from "../subagents/pdf-ops.ts";
+import { processImage } from "../image-processing/index.ts";
 import { capOutput, formatSize } from "./fs-shared.ts";
-import { readTextSlice } from "./read.ts";
+import { readTextSlice, type ReadModel } from "./read.ts";
 
 /**
  * Session context attachments (2026-10-29) — the agent side. The learner
@@ -24,7 +25,9 @@ import { readTextSlice } from "./read.ts";
  *   (pdf-ops, the researcher's text layer) and epub_* (epub-ops). The
  *   agent reads slices on demand, Claude Code style; nothing is inlined;
  * - attachmentImageParts: the wire hook that shows an image to a vision
- *   model on the message it was sent with (toLlmMessages).
+ *   model on the message it was sent with (toLlmMessages), normalized and
+ *   resized for that model like every other model-visible image (read,
+ *   pdf, visuals share processImage).
  *
  * Tool contract (the web.ts law): expected failures RETURN error strings —
  * never throw into the agent loop.
@@ -58,21 +61,47 @@ export function attachmentsPromptSection(attachments: readonly SessionAttachment
 	].join("\n");
 }
 
-/** Image content for the ids attached to one message (vision models only;
- *  unreadable files drop silently — the manifest still names them). */
-export function attachmentImageParts(attachments: readonly SessionAttachment[]) {
-	return (ids: readonly string[]): ImageContent[] => {
-		const parts: ImageContent[] = [];
-		for (const id of ids) {
-			const a = attachments.find((r) => r.record.id === id && r.record.kind === "image");
-			if (!a) continue;
-			try {
-				parts.push({ type: "image", mimeType: a.record.mimeType, data: fs.readFileSync(a.path).toString("base64") });
-			} catch {
-				// File gone from disk: the image simply isn't shown.
-			}
+/** Model-facing parts for one attached image id. */
+type ImageParts = Array<TextContent | ImageContent>;
+
+/** The wire hook for attached images (vision models only). Returns an
+ *  async preparer: given the turn's messages, it processes every attached
+ *  image they name with the model's resize limits (memoized for the
+ *  agent's lifetime — one turn), then hands toLlmMessages a sync lookup.
+ *  A missing or unprocessable file drops silently (the manifest still
+ *  names it); an image processImage can't fit sends its omission note. */
+export function attachmentImageParts(attachments: readonly SessionAttachment[], model: ReadModel) {
+	const processed = new Map<string, Promise<ImageParts>>();
+	const partsFor = (a: SessionAttachment): Promise<ImageParts> => {
+		let parts = processed.get(a.record.id);
+		if (!parts) {
+			parts = fs
+				.readFile(a.path)
+				.then(async (bytes): Promise<ImageParts> => {
+					const image = await processImage(bytes, a.record.mimeType, { resizeOptions: model.inputLimits?.images?.resize });
+					if (!image.ok) return [{ type: "text", text: image.message }];
+					const hints: ImageParts = image.hints.length > 0 ? [{ type: "text", text: image.hints.join("\n") }] : [];
+					return [...hints, { type: "image", mimeType: image.mimeType, data: image.data }];
+				})
+				// File gone from disk, or processing threw: the image simply isn't
+				// shown (convertToLlm must never throw).
+				.catch((): ImageParts => []);
+			processed.set(a.record.id, parts);
 		}
 		return parts;
+	};
+	return async (messages: readonly AgentMessage[]): Promise<(ids: readonly string[]) => ImageParts> => {
+		const named = new Set<string>();
+		for (const m of messages) {
+			if ("attachmentIds" in m && Array.isArray(m.attachmentIds)) for (const id of m.attachmentIds) named.add(id);
+		}
+		const ready = new Map<string, ImageParts>();
+		await Promise.all(
+			attachments
+				.filter((a) => a.record.kind === "image" && named.has(a.record.id))
+				.map(async (a) => ready.set(a.record.id, await partsFor(a))),
+		);
+		return (ids) => ids.flatMap((id) => ready.get(id) ?? []);
 	};
 }
 

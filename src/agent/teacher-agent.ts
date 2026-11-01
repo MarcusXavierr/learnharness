@@ -23,6 +23,8 @@ import {
 	attachmentTools,
 	type SessionAttachment,
 } from "./tools/attachments.ts";
+import { createReadTool, readTool } from "./tools/read.ts";
+import { CLAUDE_CODE_PROVIDER } from "./claude-code/constants.ts";
 import { quizInputObject, quizInputProblems } from "../core/question-core.ts";
 import { QUESTION_TOOLS, type EnabledTools } from "../core/pending.ts";
 import { toLlmMessages, nativeInputCause, PRACTICE_PROBLEM_TOOL } from "../core/native-messages.ts";
@@ -206,7 +208,9 @@ function baseAgentOptions(kind: AgentKind, opts: AgentBuildOptions, tools: Agent
 	const stopper = makeQuestionStopper(kind);
 	const systemPrompt = systemPromptFor(kind, opts);
 	const sessionTools = opts.tools === undefined ? Object.values(healToolRecord(attachmentTools(opts.attachments ?? []))) : [];
-	const showImages = engine.model.input?.includes("image") ?? false;
+	const attachedImages = engine.model.input?.includes("image")
+		? attachmentImageParts(opts.attachments ?? [], engine.model)
+		: null;
 	// Debug recorder (owner, 2026-10-04): raw provider events when
 	// LH_PROVIDER_EVENTS=1 and the caller handed a chatId; undefined is
 	// the normal no-observer path (tests, env-off).
@@ -224,9 +228,11 @@ function baseAgentOptions(kind: AgentKind, opts: AgentBuildOptions, tools: Agent
 			// Match Claude across providers (including OpenRouter), not the API
 			// transport. Explicit test registries remain caller-owned.
 			tools: [
-				...tools,
+				...tools.map((tool) => tool.name === "read" && tool.execute === readTool.execute
+					? { ...tool, execute: createReadTool(engine.model).execute as AgentTool<any>["execute"] }
+					: tool),
 				...sessionTools,
-				...(opts.tools === undefined && engine.model.id.toLowerCase().includes("claude")
+				...(opts.tools === undefined && (engine.model.provider === CLAUDE_CODE_PROVIDER || engine.model.id.toLowerCase().includes("claude"))
 					? [withArgumentHeal(sendToUserTool)]
 					: []),
 			],
@@ -255,9 +261,10 @@ function baseAgentOptions(kind: AgentKind, opts: AgentBuildOptions, tools: Agent
 		// an abort's dangling question call gets its INTERRUPTED result. It
 		// must never throw (pi's convertToLlm contract).
 		// Attached images ride the message they were sent with — vision
-		// models only; for the rest the ids just strip (the manifest names it).
-		convertToLlm: (messages) =>
-			toLlmMessages(messages, showImages ? { attachmentParts: attachmentImageParts(opts.attachments ?? []) } : {}),
+		// models only, processed for the model like every other image; for
+		// the rest the ids just strip (the manifest names it).
+		convertToLlm: async (messages) =>
+			toLlmMessages(messages, attachedImages ? { attachmentParts: await attachedImages(messages) } : {}),
 		prepareRequest: (request) => {
 			if (opts.callPurpose) {
 				let learner = false, automatic = false;

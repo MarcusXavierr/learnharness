@@ -9,7 +9,9 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { after, describe, it } from "node:test";
-import { createFauxCore, fauxAssistantMessage, fauxText, fauxToolCall, type FauxResponseStep, type SystemMessage } from "@earendil-works/pi-ai";
+import { createFauxCore, fauxAssistantMessage, fauxText, fauxToolCall, type FauxResponseStep, type ModelImageResizeOptions, type SystemMessage } from "@earendil-works/pi-ai";
+import { createCanvas } from "@napi-rs/canvas";
+import * as photon from "@silvia-odwyer/photon-node";
 import { createTeacherAgent } from "../src/agent/teacher-agent.ts";
 import { handleChatRequest } from "../src/server/chat-handler.ts";
 import { deleteChatSession } from "../src/server/chats.ts";
@@ -41,9 +43,18 @@ interface Seen {
 }
 
 /** Scripted model: each step sees the request context and returns a reply. */
-function scripted(steps: ((seen: Seen) => ReturnType<typeof fauxAssistantMessage>)[], opts: { vision?: boolean } = {}) {
+function scripted(
+	steps: ((seen: Seen) => ReturnType<typeof fauxAssistantMessage>)[],
+	opts: { vision?: boolean; imageResize?: ModelImageResizeOptions } = {},
+) {
 	const seen: Seen[] = [];
-	const faux = createFauxCore(opts.vision === false ? { models: [{ id: "text-only", input: ["text"] }] } : {});
+	const faux = createFauxCore(
+		opts.vision === false
+			? { models: [{ id: "text-only", input: ["text"] }] }
+			: opts.imageResize
+				? { models: [{ id: "small-vision", input: ["text", "image"], inputLimits: { images: { resize: opts.imageResize } } }] }
+				: {},
+	);
 	faux.setResponses(
 		steps.map((step): FauxResponseStep => (context) => {
 			// The agent declares its prompt and loadout in leading system messages.
@@ -211,6 +222,27 @@ describe("session attachments (upload route → turn)", () => {
 		const stored = fs.readFileSync(path.join(PATHS.chats, `${chatId}.json`), "utf-8");
 		assert.ok(!stored.includes(PNG.toString("base64")), "no image bytes in the chat record");
 		assert.ok(stored.includes(image.record.id), "the message keeps the attachment id");
+	});
+
+	it("resizes an attached image to the model's image limits before sending it", async () => {
+		const chatId = newChat();
+		const canvas = createCanvas(64, 48);
+		const context = canvas.getContext("2d");
+		context.fillStyle = "#33aadd";
+		context.fillRect(0, 0, 64, 48);
+		const image = await attach(chatId, "photo.png", canvas.toBuffer("image/png"));
+		const { engine, seen } = scripted([() => fauxAssistantMessage([fauxText("A blue field.")])], { imageResize: { maxWidth: 16, maxHeight: 16 } });
+		await send(chatId, engine, "what is this?", [image.record.id]);
+
+		const parts = seen[0]!.messages.find((m) => m.role === "user")!.content as Array<{ type: string; data?: string; text?: string }>;
+		const sent = parts.find((p) => p.type === "image")!;
+		const decoded = photon.PhotonImage.new_from_byteslice(Buffer.from(sent.data!, "base64"));
+		try {
+			assert.ok(decoded.get_width() <= 16 && decoded.get_height() <= 16, `sent ${decoded.get_width()}×${decoded.get_height()}`);
+		} finally {
+			decoded.free();
+		}
+		assert.ok(parts.some((p) => p.type === "text" && /64x48/.test(p.text ?? "")), "the model is told the original size");
 	});
 
 	it("keeps a text-only model working: the image is named in the manifest, not sent", async () => {

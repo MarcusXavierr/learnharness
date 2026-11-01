@@ -40,19 +40,13 @@ const EXCLUDED_DIR_NAMES = new Set(["node_modules", ".git", "Library", ".Trash"]
 
 /** Resolve a tool path argument: absolute stays, relative/absent → home.
  *  (pi resolves against the project cwd; the harness's "project" is the
- *  learner's life, so the home directory is the anchor.) */
+ *  learner's life, so the home directory is the anchor.) A leading `~` or
+ *  `~/` is the home directory, as a shell would expand it — learners and
+ *  models write paths that way. `~user` is not expanded. */
 export function resolveSourcePath(p?: string): string {
 	if (!p) return os.homedir();
+	if (p === "~" || p.startsWith("~/") || p.startsWith(`~${path.sep}`)) return path.join(os.homedir(), p.slice(1));
 	return path.isAbsolute(p) ? p : path.join(os.homedir(), p);
-}
-
-/** Resolve a tool-supplied path and require it to live INSIDE `dir` —
- *  the scoped tools' filesystem ends at that wall (null = outside). */
-export function scopedPath(dir: string, filePath: string): string | null {
-	const root = path.resolve(dir) + path.sep;
-	const resolved = path.resolve(dir, filePath);
-	if (!resolved.startsWith(root)) return null;
-	return resolved;
 }
 
 /** pi's formatSize idiom (50KB prints as "50.0KB"). */
