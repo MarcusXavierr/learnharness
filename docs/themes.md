@@ -1,8 +1,8 @@
 # Themes
 
 **Settings → Appearance → Theme** sets every color in the app from one palette.
-LearnHarness ships eleven presets: Default (the original dark palette), Catppuccin
-Latte, Frappé, Macchiato and Mocha, Rosé Pine and Rosé Pine Dawn, Gruvbox Dark, Ivory, Pastel, and NvChad Onedark.
+LearnHarness ships twelve presets: Default (the original dark palette), Catppuccin
+Latte, Frappé, Macchiato and Mocha, Rosé Pine and Rosé Pine Dawn, Gruvbox Dark, Ivory, Pastel, NvChad Onedark, and Soft Graphite.
 Each theme declares whether it is dark or light, and the window chrome follows it.
 
 ## Overriding single colors
